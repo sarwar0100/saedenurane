@@ -2,6 +2,8 @@ alter table public.direct_messages
   add column if not exists read_at timestamptz,
   add column if not exists reaction text;
 
+alter table public.direct_messages replica identity full;
+
 drop policy if exists "Participants can update direct messages" on public.direct_messages;
 create policy "Participants can update direct messages"
 on public.direct_messages

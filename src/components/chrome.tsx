@@ -1,15 +1,24 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 
 type ChromeCtx = {
   hidden: boolean;
-  setHidden: (v: boolean) => void;
+  acquireHide: () => () => void;
 };
 
-const Ctx = createContext<ChromeCtx>({ hidden: false, setHidden: () => {} });
+const Ctx = createContext<ChromeCtx>({ hidden: false, acquireHide: () => () => {} });
 
 export function ChromeProvider({ children }: { children: ReactNode }) {
-  const [hidden, setHidden] = useState(false);
-  return <Ctx.Provider value={{ hidden, setHidden }}>{children}</Ctx.Provider>;
+  const [hideCount, setHideCount] = useState(0);
+  const acquireHide = useCallback(() => {
+    setHideCount((count) => count + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      setHideCount((count) => Math.max(0, count - 1));
+    };
+  }, []);
+  return <Ctx.Provider value={{ hidden: hideCount > 0, acquireHide }}>{children}</Ctx.Provider>;
 }
 
 export function useChrome() {
@@ -18,10 +27,9 @@ export function useChrome() {
 
 /** Hides the gold counter + bottom nav while the component is mounted. */
 export function useHideChrome(active = true) {
-  const { setHidden } = useChrome();
+  const { acquireHide } = useChrome();
   useEffect(() => {
     if (!active) return;
-    setHidden(true);
-    return () => setHidden(false);
-  }, [active, setHidden]);
+    return acquireHide();
+  }, [active, acquireHide]);
 }

@@ -140,6 +140,63 @@
   }
 }
 
+@keyframes reaction-particle-float {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 2px, 0) scale(0.55) rotate(0deg);
+  }
+  18% {
+    opacity: 0.9;
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(var(--reaction-drift), -30px, 0) scale(1) rotate(var(--reaction-rotation));
+  }
+}
+
+.reaction-particle {
+  position: absolute;
+  left: 50%;
+  top: 45%;
+  z-index: 0;
+  font-size: 0.9rem;
+  line-height: 1;
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgb(0 0 0 / 35%);
+  animation: reaction-particle-float 700ms cubic-bezier(0.2, 0.75, 0.3, 1) both;
+}
+
+.reaction-particle-1 {
+  --reaction-drift: -12px;
+  --reaction-rotation: -18deg;
+}
+
+.reaction-particle-2 {
+  --reaction-drift: -6px;
+  --reaction-rotation: 12deg;
+}
+
+.reaction-particle-3 {
+  --reaction-drift: 1px;
+  --reaction-rotation: -8deg;
+}
+
+.reaction-particle-4 {
+  --reaction-drift: 8px;
+  --reaction-rotation: 16deg;
+}
+
+.reaction-particle-5 {
+  --reaction-drift: 14px;
+  --reaction-rotation: -12deg;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reaction-particle {
+    animation-duration: 1ms;
+  }
+}
+
 @keyframes rise-in {
   from {
     opacity: 0;

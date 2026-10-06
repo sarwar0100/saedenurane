@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useApp } from "@/lib/app-store";
 import { GoldBar } from "@/components/GoldBar";
 import { useChrome } from "@/components/chrome";
@@ -12,6 +12,8 @@ export function GoldCounter() {
   const [displayGold, setDisplayGold] = useState(gold);
   const [isAnimating, setIsAnimating] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false); // ستەیتی نوێ بۆ کاتی یاریکردن
+  const [notificationHides, setNotificationHides] = useState(0);
+  const notificationHidesRef = useRef(0);
 
   // وەرگرتنی زانیاری پەیجی ئێستا
   const location = useLocation();
@@ -38,15 +40,27 @@ export function GoldCounter() {
     // ئاماژەکان بۆ شاردنەوە و پیشاندانەوەی زێڕەکە
     const handleHide = () => setIsPlaying(true);
     const handleShow = () => setIsPlaying(false);
+    const handleNotificationHide = () => {
+      notificationHidesRef.current += 1;
+      setNotificationHides(notificationHidesRef.current);
+    };
+    const handleNotificationShow = () => {
+      notificationHidesRef.current = Math.max(0, notificationHidesRef.current - 1);
+      setNotificationHides(notificationHidesRef.current);
+    };
 
     window.addEventListener("deduct-gold", handleDeduct);
     window.addEventListener("hide-gold-counter", handleHide);
     window.addEventListener("show-gold-counter", handleShow);
+    window.addEventListener("hide-gold-counter-notification", handleNotificationHide);
+    window.addEventListener("show-gold-counter-notification", handleNotificationShow);
 
     return () => {
       window.removeEventListener("deduct-gold", handleDeduct);
       window.removeEventListener("hide-gold-counter", handleHide);
       window.removeEventListener("show-gold-counter", handleShow);
+      window.removeEventListener("hide-gold-counter-notification", handleNotificationHide);
+      window.removeEventListener("show-gold-counter-notification", handleNotificationShow);
     };
   }, [app]);
 
@@ -91,7 +105,7 @@ export function GoldCounter() {
   }
 
   return (
-    <div className="absolute top-4 left-4 z-[100] pointer-events-none">
+    <div className={`absolute top-4 left-4 z-[100] pointer-events-none transition-opacity duration-200 ${notificationHides > 0 ? "opacity-0 pointer-events-none" : "opacity-100"}`}>
       <div className="glass-strong flex items-center gap-1.5 rounded-full py-1 pr-2.5 pl-1 pointer-events-auto">
         <span className="flex size-7 items-center justify-center rounded-full bg-black/30">
           <GoldBar className="w-5" />

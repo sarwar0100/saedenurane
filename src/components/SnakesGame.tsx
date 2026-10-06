@@ -12,7 +12,7 @@ import {
 } from "@/lib/snakes-ladders";
 import type { BoardSkin } from "@/lib/game-data";
 import { useHideChrome } from "@/components/chrome";
-import { useApp, userStorageKey } from "@/lib/app-store";
+import { avatarImageSource, useApp, userStorageKey } from "@/lib/app-store";
 import { PlayerProfileSheet } from "@/components/PlayerProfileSheet";
 import { createClient } from "@supabase/supabase-js";
 
@@ -65,7 +65,7 @@ function Token({
         }}
       >
         <img
-          src={player.token_url || player.avatar}
+          src={avatarImageSource(player.token_url || player.avatar)}
           alt="token"
           className="size-full object-cover"
         />
@@ -133,7 +133,7 @@ function PlayerAvatar({ player, pro = false }: { player: GamePlayer; pro?: boole
   return (
     <div className="relative shrink-0 size-8">
       <img
-        src={player.avatar}
+          src={avatarImageSource(player.avatar)}
         alt={player.name}
         className={`size-full rounded-md object-cover border ${pro ? "border-yellow-400 shadow-[0_0_8px_rgba(250,204,21,.8)]" : "border-black/5"} ${player.kicked ? "grayscale" : ""}`}
       />
@@ -210,38 +210,52 @@ export function SnakesGame({
   board,
   me,
   stickers = [],
+  initialPlayers,
   matchId = DEFAULT_MATCH_ID,
   onClose,
 }: {
   board: BoardSkin & { image_url?: string };
   me: { name: string; avatar: string; token_url?: string };
   stickers?: any[];
+  initialPlayers?: Array<{ id: string; name: string; avatar: string; token_url?: string }>;
   matchId?: string;
   onClose: () => void;
 }) {
   useHideChrome();
-  const { user, isProMember } = useApp();
-  const [phase, setPhase] = useState<"matchmaking" | "playing">("matchmaking");
+  const { user, isProMember, recordGameResult } = useApp();
+  const synchronizedMatch = Boolean(initialPlayers?.length && matchId !== DEFAULT_MATCH_ID);
+  const localPlayerId = synchronizedMatch ? (user?.id ?? "me") : "me";
+  const [phase, setPhase] = useState<"matchmaking" | "playing">(initialPlayers?.length ? "playing" : "matchmaking");
   const [gameStickers, setGameStickers] = useState(stickers);
-  const [players, setPlayers] = useState<GamePlayer[]>(() => [
-    {
-      id: "me",
-      name: me.name,
-      avatar: me.avatar,
-      color: PLAYER_COLORS[0]!,
-      isHuman: true,
-      position: 0,
-      token_url: me.token_url,
-    } as any,
-    ...BOT_NAMES.map((n, i) => ({
-      id: `bot-${i}`,
-      name: n,
-      avatar: `https://api.dicebear.com/9.x/adventurer/svg?seed=${encodeURIComponent(n)}`,
-      color: PLAYER_COLORS[i + 1]!,
-      isHuman: false,
-      position: 0,
-    })),
-  ]);
+  const [players, setPlayers] = useState<GamePlayer[]>(() => initialPlayers?.length
+    ? initialPlayers.slice(0, 4).map((player, index) => ({
+      id: player.id,
+        name: player.name,
+        avatar: player.avatar,
+        color: PLAYER_COLORS[index]!,
+      isHuman: player.id === (user?.id ?? "me"),
+        position: 0,
+        ...(player.token_url ? { token_url: player.token_url } : {}),
+      }))
+    : [
+        {
+          id: "me",
+          name: me.name,
+          avatar: me.avatar,
+          color: PLAYER_COLORS[0]!,
+          isHuman: true,
+          position: 0,
+          token_url: me.token_url,
+        } as any,
+        ...BOT_NAMES.map((n, i) => ({
+          id: `bot-${i}`,
+          name: n,
+          avatar: `https://api.dicebear.com/9.x/adventurer/svg?seed=${encodeURIComponent(n)}`,
+          color: PLAYER_COLORS[i + 1]!,
+          isHuman: false,
+          position: 0,
+        })),
+      ]);
   const [turn, setTurn] = useState(0);
   const [dice, setDice] = useState(1);
   const [rolling, setRolling] = useState(false);
@@ -250,6 +264,7 @@ export function SnakesGame({
   const [selectedPlayer, setSelectedPlayer] = useState<GamePlayer | null>(null);
   const [timeLeft, setTimeLeft] = useState(TURN_SECONDS);
   const [timerRound, setTimerRound] = useState(0);
+  const [matchChannelReady, setMatchChannelReady] = useState(false);
   const [tokenMotion, setTokenMotion] = useState<Record<string, "climb" | "slide" | "capture">>({});
 
   // ستەیتی ستیکەرەکان
@@ -260,11 +275,16 @@ export function SnakesGame({
   const alive = useRef(true);
   const missedTurns = useRef<Record<string, number>>({});
   const playersRef = useRef(players);
+  const turnRef = useRef(turn);
   const handledTimeout = useRef<string | null>(null);
   const reactionChannelRef = useRef<ReturnType<NonNullable<typeof supabase>["channel"]> | null>(
     null,
   );
+  const gameStatusUpdate = useRef(Promise.resolve());
+  const turnHandlerRef = useRef<(payload: { playerId?: string; turnIndex?: number; roll?: number; turnId?: string }) => void>(() => {});
+  const processedTurnIds = useRef(new Set<string>());
   playersRef.current = players;
+  turnRef.current = turn;
 
   useEffect(() => {
     alive.current = true;
@@ -272,6 +292,31 @@ export function SnakesGame({
       alive.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!supabase || !user?.id) return;
+    const updateGameStatus = (status: "online" | "in_game") => {
+      gameStatusUpdate.current = gameStatusUpdate.current
+        .then(async () => {
+          const { error } = await supabase.rpc("set_profile_game_status", {
+            new_status: status,
+          });
+          if (error) console.warn("Profile game status update failed:", error.message);
+        })
+        .catch((error: unknown) => {
+          console.warn("Profile game status update failed:", error);
+        });
+    };
+    updateGameStatus("in_game");
+    return () => updateGameStatus("online");
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (!winner || winner.id !== localPlayerId) return;
+    recordGameResult(true);
+    // The winner is set once per game; the overlay owns the final result.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localPlayerId, winner]);
 
   useEffect(() => {
     const loadStickers = (slots?: Array<string | null>) => {
@@ -324,15 +369,21 @@ export function SnakesGame({
 
   useEffect(() => {
     if (!supabase) return;
-    const channel = supabase.channel(`snakes-ladders-match:${matchId}`);
+    const channel = supabase.channel(`snakes-ladders-match:${matchId}`, {
+      config: { broadcast: { self: false } },
+    });
     channel.on("broadcast", { event: "PIECE_CAPTURED" }, ({ payload }) => {
       playCaptureSound(payload?.soundUrl);
     });
+    channel.on("broadcast", { event: "TURN_ROLLED" }, ({ payload }) => {
+      turnHandlerRef.current(payload);
+    });
     reactionChannelRef.current = channel;
-    void channel.subscribe();
+    void channel.subscribe((status) => setMatchChannelReady(status === "SUBSCRIBED"));
 
     return () => {
       reactionChannelRef.current = null;
+      setMatchChannelReady(false);
       void supabase.removeChannel(channel);
     };
   }, [matchId, playCaptureSound]);
@@ -379,7 +430,7 @@ export function SnakesGame({
   }, [currentPlayer?.id, currentPlayer?.kicked, phase, timerRound, turn, winner]);
 
   const takeTurn = useCallback(
-    async (playerIndex: number, automatic = false) => {
+    async (playerIndex: number, automatic = false, synchronizedRoll?: number) => {
       if (busy.current || winner) return;
       busy.current = true;
 
@@ -396,7 +447,7 @@ export function SnakesGame({
         setDice(1 + Math.floor(Math.random() * 6));
         await delay(55);
       }
-      const roll = 1 + Math.floor(Math.random() * 6);
+      const roll = synchronizedRoll ?? (1 + Math.floor(Math.random() * 6));
       setDice(roll);
       setRolling(false);
       await delay(180);
@@ -438,7 +489,7 @@ export function SnakesGame({
       );
       const eaten = capturedPlayers.map((player) => player.name);
       if (capturedPlayers.length) {
-        if (current.id === "me") {
+        if (current.id === localPlayerId) {
           const captureEvent = {
             type: "CAPTURE_PIECE",
             attackerId: user?.id ?? current.id,
@@ -491,8 +542,49 @@ export function SnakesGame({
       setTurn(nextTurnIndex(index, players));
       setStatus("");
     },
-    [nextTurnIndex, playCaptureSound, players, setPos, user?.id, winner],
+    [localPlayerId, nextTurnIndex, playCaptureSound, players, setPos, user?.id, winner],
   );
+
+  turnHandlerRef.current = ({ playerId, turnIndex, roll, turnId }) => {
+    if (
+      !synchronizedMatch ||
+      typeof playerId !== "string" ||
+      typeof turnIndex !== "number" ||
+      typeof roll !== "number" ||
+      !Number.isInteger(roll) ||
+      roll < 1 ||
+      roll > 6 ||
+      (turnId && processedTurnIds.current.has(turnId)) ||
+      turnRef.current !== turnIndex ||
+      playersRef.current[turnIndex]?.id !== playerId ||
+      playerId === localPlayerId
+    ) return;
+    if (turnId) processedTurnIds.current.add(turnId);
+    void takeTurn(turnIndex, false, roll);
+  };
+
+  const requestTurn = useCallback(async (playerIndex: number, automatic = false) => {
+    const current = playersRef.current[playerIndex];
+    if (!current || current.id !== localPlayerId) return;
+    if (!synchronizedMatch) {
+      void takeTurn(playerIndex, automatic);
+      return;
+    }
+    if (!matchChannelReady || !reactionChannelRef.current) return;
+    const roll = 1 + Math.floor(Math.random() * 6);
+    const turnId = crypto.randomUUID();
+    const result = await reactionChannelRef.current.send({
+      type: "broadcast",
+      event: "TURN_ROLLED",
+      payload: { playerId: current.id, turnIndex: playerIndex, roll, turnId },
+    });
+    if (result !== "ok") {
+      setStatus("پەیوەندی یاری لەدەست چوو، دووبارە هەوڵ بدەرەوە");
+      return;
+    }
+    processedTurnIds.current.add(turnId);
+    void takeTurn(playerIndex, automatic, roll);
+  }, [localPlayerId, matchChannelReady, synchronizedMatch, takeTurn]);
 
   useEffect(() => {
     if (timeLeft !== 0 || !currentPlayer || winner || busy.current) return;
@@ -516,16 +608,20 @@ export function SnakesGame({
       return;
     }
 
-    void takeTurn(turn, true);
-  }, [currentPlayer, nextTurnIndex, takeTurn, timeLeft, timerRound, turn, winner]);
+    if (currentPlayer.id === localPlayerId) {
+      void requestTurn(turn, true);
+    } else if (!synchronizedMatch) {
+      void takeTurn(turn, true);
+    }
+  }, [currentPlayer, localPlayerId, nextTurnIndex, requestTurn, synchronizedMatch, takeTurn, timeLeft, timerRound, turn, winner]);
 
   useEffect(() => {
-    if (phase !== "playing" || winner) return;
+    if (synchronizedMatch || phase !== "playing" || winner) return;
     const current = players[turn];
     if (!current || current.isHuman) return;
     const t = setTimeout(() => void takeTurn(turn), 700);
     return () => clearTimeout(t);
-  }, [phase, turn, winner, players, takeTurn]);
+  }, [phase, turn, winner, players, synchronizedMatch, takeTurn]);
 
   const handleSendSticker = (stickerUrl: string) => {
     setActiveStickers((prev) => ({ ...prev, me: stickerUrl }));
@@ -541,7 +637,7 @@ export function SnakesGame({
     }, 3000);
   };
 
-  const myTurn = players[turn]?.isHuman && !players[turn]?.kicked && !winner && !busy.current;
+  const myTurn = players[turn]?.id === localPlayerId && !players[turn]?.kicked && !winner && !busy.current;
   const timerVisible =
     phase === "playing" &&
     !!currentPlayer &&
@@ -549,7 +645,7 @@ export function SnakesGame({
     !winner &&
     !rolling &&
     !busy.current;
-  const meP = players[0]!;
+  const meP = players.find((player) => player.id === localPlayerId) ?? players[0]!;
   const opponents = players.slice(1);
   const myTurnActive = players[turn]?.id === meP.id;
   const boardImageUrl = board?.image_url || "";
@@ -733,8 +829,8 @@ export function SnakesGame({
           {/* dice */}
           <div className="relative mt-1 mb-2.5 flex shrink-0 items-center justify-center z-30">
             <button
-              onClick={() => void takeTurn(turn)}
-              disabled={!myTurn}
+              onClick={() => void requestTurn(turn)}
+              disabled={!myTurn || (synchronizedMatch && !matchChannelReady)}
               aria-label="تاوەدان"
               className="press disabled:opacity-50"
             >
@@ -759,7 +855,7 @@ export function SnakesGame({
                   className="press shrink-0"
                   aria-label={`پرۆفایلی ${meP.name}`}
                 >
-                  <PlayerAvatar player={meP} pro={isProMember && !!user?.id && meP.id === "me"} />
+                  <PlayerAvatar player={meP} pro={isProMember && !!user?.id && meP.id === localPlayerId} />
                 </button>
               </div>
               <div className="min-w-0 flex-1">
@@ -795,6 +891,7 @@ export function SnakesGame({
             avatar: selectedPlayer.avatar,
             games_played: 0,
             wins: 0,
+            points: 0,
             gold: 0,
           }}
           followersCount={Math.max(0, players.length - 1)}
@@ -856,7 +953,7 @@ function Matchmaking({ players, onExit }: { players: GamePlayer[]; onExit: () =>
               className="size-14 overflow-hidden rounded-full border-2 bg-white"
               style={{ borderColor: p.color.from }}
             >
-              <img src={p.avatar} alt={p.name} className="size-full object-cover" />
+              <img src={avatarImageSource(p.avatar)} alt={p.name} className="size-full object-cover" />
             </div>
             <span className="max-w-16 md:max-w-20 truncate text-[11px] md:text-xs font-semibold text-[#5c5140]">
               {p.name}
@@ -886,7 +983,7 @@ function WinOverlay({ winner, onClose }: { winner: GamePlayer; onClose: () => vo
           className="mx-auto size-24 overflow-hidden rounded-full border-4"
           style={{ borderColor: winner.color.from }}
         >
-          <img src={winner.avatar} alt={winner.name} className="size-full object-cover" />
+          <img src={avatarImageSource(winner.avatar)} alt={winner.name} className="size-full object-cover" />
         </div>
         <h3 className="mt-4 text-3xl font-extrabold text-neutral-900">
           {winner.isHuman ? "تۆ بردتەوە! 🎉" : "یاری تەواو بوو"}

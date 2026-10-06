@@ -1,11 +1,15 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { createPortal } from "react-dom";
 import {
   Component,
+  useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ErrorInfo,
   type FormEvent,
+  type RefObject,
   type ReactNode,
 } from "react";
 import {
@@ -13,16 +17,19 @@ import {
   Ban,
   Check,
   Copy,
+  CopyCheck,
   LogOut,
   Plus,
+  Reply,
   Send,
+  Trash2,
   UserPlus,
   Users,
   X,
   Image,
 } from "lucide-react";
 import { toast } from "sonner";
-import { formatTime, useApp, type Friend, type Group } from "@/lib/app-store";
+import { formatTime, useApp, type Friend, type Group, type Message } from "@/lib/app-store";
 import { useHideChrome } from "@/components/chrome";
 import { PlayerProfileSheet } from "@/components/PlayerProfileSheet";
 import { createClient } from "@supabase/supabase-js";
@@ -32,6 +39,15 @@ const supabaseKey = import.meta.env["VITE_SUPABASE_PUBLISHABLE_KEY"] || "";
 const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
 type DatabaseFriendRequest = { requestId: string; friend: Friend; status: string };
+const EMPTY_CHAT_MESSAGES: Message[] = [];
+type MessagePopupPosition = {
+  reactionTop: number;
+  reactionLeft: number;
+  actionTop: number;
+  actionLeft: number;
+  reactionWidth: number;
+  actionHeight: number;
+};
 
 export const Route = createFileRoute("/app/friends")({
   head: () => ({
@@ -124,8 +140,17 @@ function FriendsRoute() {
 }
 
 function FriendsTab() {
-  const { addFriend, visibleFriends, directMessages, unreadFor, user } = useApp();
-  const safeFriends = Array.isArray(visibleFriends) ? visibleFriends.filter(Boolean) : [];
+  const {
+    addFriend,
+    visibleFriends,
+    directMessages,
+    unreadFor,
+    user,
+  } = useApp();
+  const acceptedFriends = Array.isArray(visibleFriends)
+    ? visibleFriends.filter((friend) => Boolean(friend?.id))
+    : [];
+  const safeFriends = acceptedFriends;
   const [databaseRequests, setDatabaseRequests] = useState<DatabaseFriendRequest[]>([]);
   const [view, setView] = useState<View>("friends");
   const [openFriend, setOpenFriend] = useState<Friend | null>(null);
@@ -141,53 +166,73 @@ function FriendsTab() {
       return;
     }
     let cancelled = false;
+    let refreshSequence = 0;
     const loadRequests = async () => {
-      const { data } = await supabase
-        .from("friend_requests")
-        .select(
-          "id, sender_id, status, profiles:sender_id(username, avatar_url, city, birth_year, online, points, gold, games_played, wins, losses)",
-        )
-        .eq("receiver_id", user.id)
-        .eq("status", "pending");
-      if (cancelled) return;
-      const requests = (data ?? []).flatMap((row) => {
-        const profile = Array.isArray(row.profiles) ? row.profiles[0] : row.profiles;
-        if (!profile) return [];
-        const gamesPlayed = Number(profile.games_played ?? 0);
-        const friend: Friend = {
-          id: String(row.sender_id),
-          name: String(profile.username ?? "یاریزان"),
-          avatar: String(profile.avatar_url ?? ""),
-          city: profile.city ?? undefined,
-          birth_year: profile.birth_year ?? undefined,
-          online: profile.online !== false,
-          points: Number(profile.points ?? 0),
-          gold: Number(profile.gold ?? 0),
-          games_played: gamesPlayed,
-          wins: Number(profile.wins ?? 0),
-          losses: Number(profile.losses ?? Math.max(0, gamesPlayed - Number(profile.wins ?? 0))),
-        };
-        return [{ requestId: String(row.id), friend, status: String(row.status) }];
-      });
-      setDatabaseRequests(requests);
+      const sequence = ++refreshSequence;
+      try {
+        const { data, error } = await supabase
+          .from("friend_requests")
+          .select(
+            "id, sender_id, receiver_id, status, created_at, profiles:sender_id(id, username, display_name, avatar_url, bio)",
+          )
+          .eq("receiver_id", user.id)
+          .eq("status", "pending");
+        if (cancelled || sequence !== refreshSequence) return;
+        if (error) {
+          console.error("Friend request fetch error:", error);
+          setDatabaseRequests([]);
+          return;
+        }
+        const requests = (data ?? []).flatMap((row) => {
+          const profile = Array.isArray(row.profiles) ? row.profiles[0] : row.profiles;
+          if (!profile) return [];
+          const friend: Friend = {
+            id: String(profile.id ?? row.sender_id),
+            name: String(profile.display_name ?? profile.username ?? "یاریزان"),
+            ...(profile.bio ? { bio: profile.bio } : {}),
+            avatar: String(profile.avatar_url ?? ""),
+            points: 0,
+            gold: 0,
+            games_played: 0,
+            wins: 0,
+          };
+          return [{ requestId: String(row.id), friend, status: String(row.status) }];
+        });
+        setDatabaseRequests(requests);
+      } catch (error) {
+        if (!cancelled && sequence === refreshSequence) {
+          console.error("Friend request fetch error:", error);
+          setDatabaseRequests([]);
+        }
+      }
     };
-    void loadRequests();
-    const channel = supabase
-      .channel(`friend-requests:${user.id}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "friend_requests",
-          filter: `receiver_id=eq.${user.id}`,
-        },
-        () => void loadRequests(),
-      )
-      .subscribe();
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+    try {
+      channel = supabase
+        .channel(`friend-requests:${user.id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "friend_requests",
+            filter: `receiver_id=eq.${user.id}`,
+          },
+          () => void loadRequests(),
+        )
+        .subscribe((status) => {
+          if (status === "SUBSCRIBED") void loadRequests();
+        });
+    } catch (error) {
+      console.warn("Friend-request realtime updates unavailable:", error);
+    }
     return () => {
       cancelled = true;
-      void supabase.removeChannel(channel);
+      if (channel) {
+        void supabase.removeChannel(channel).catch((error: unknown) => {
+          console.warn("Friend-request realtime cleanup failed:", error);
+        });
+      }
     };
   }, [user?.id]);
 
@@ -254,9 +299,9 @@ function FriendsTab() {
                     src={renderProfilePic(f)}
                     onError={handleProfileImageError}
                     alt={f.name ?? "هاوڕێ"}
-                    className="size-12 rounded-full bg-secondary"
+                    className={`size-12 rounded-full bg-secondary ring-2 ${f.online === false || f.hideOnlineStatus ? "ring-slate-400/60" : "ring-emerald-400/80 shadow-[0_0_12px_rgba(52,211,153,0.3)]"}`}
                   />
-                  {f.online !== false && (
+                  {f.online !== false && !f.hideOnlineStatus && (
                     <span
                       aria-label="سەرهێڵ"
                       className="absolute bottom-0 right-0 size-3 rounded-full bg-green-500 ring-2 ring-background"
@@ -297,14 +342,13 @@ function FriendsTab() {
       {requestsOpen && (
         <FriendRequests
           requests={databaseRequests}
+          currentUserId={user?.id}
           onClose={() => setRequestsOpen(false)}
-          onStatusChange={(requestId, status, friend) => {
-            if (status === "accepted" || status === "rejected") {
-              if (status === "accepted") addFriend(friend);
-              setDatabaseRequests((requests) =>
-                requests.filter((request) => request.requestId !== requestId),
-              );
-            }
+          onStatusChange={(requestId, friend) => {
+            addFriend(friend);
+            setDatabaseRequests((requests) =>
+              requests.filter((request) => request.requestId !== requestId),
+            );
           }}
         />
       )}
@@ -314,9 +358,14 @@ function FriendsTab() {
       {selectedProfile?.id && (
         <PlayerProfileSheet
           player={selectedProfile}
-          followersCount={safeFriends.length}
-          followingCount={safeFriends.length}
+          followersCount={acceptedFriends.length}
+          followingCount={acceptedFriends.length}
           allowFriendRequest
+          showActions
+          onRemoved={() => {
+            setSelectedProfile(null);
+            setOpenFriend(null);
+          }}
           onMessage={() => {
             setSelectedProfile(null);
             setOpenFriend(selectedProfile);
@@ -335,7 +384,7 @@ function ActionPopup({
   popup: { type: "friend" | "group"; id: string };
   onClose: () => void;
 }) {
-  const { blockFriend, leaveGroup } = useApp();
+  const { blockUser, leaveGroup } = useApp();
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-background/60 px-10"
@@ -348,7 +397,7 @@ function ActionPopup({
         {popup.type === "friend" ? (
           <button
             onClick={() => {
-              blockFriend(popup.id);
+              blockUser(popup.id);
               toast.success("بلۆک کرا");
               onClose();
             }}
@@ -401,6 +450,11 @@ function ChatBubble({
   reaction,
   messageId,
   onReaction,
+  replyText,
+  replyAuthor,
+  onReply,
+  onDelete,
+  scrollContainerRef,
 }: {
   mine: boolean;
   text?: string;
@@ -410,57 +464,249 @@ function ChatBubble({
   imageUrl?: string | undefined;
   reaction?: string | undefined;
   messageId?: string;
-  onReaction?: (messageId: string, reaction: string) => void;
+  onReaction?: (messageId: string, reaction: string | null) => void | Promise<void>;
+  replyText?: string | undefined;
+  replyAuthor?: string | undefined;
+  onReply?: () => void;
+  onDelete?: (() => void) | undefined;
+  scrollContainerRef?: RefObject<HTMLDivElement | null>;
 }) {
   const safeText = typeof text === "string" ? text : "";
   const codeMatch = /^\d{6}$/.test(safeText.trim());
   const { joinGroupByCode } = useApp();
   const [reactionMenuOpen, setReactionMenuOpen] = useState(false);
+  const [actionMenuOpen, setActionMenuOpen] = useState(false);
+  const [popupPosition, setPopupPosition] = useState<MessagePopupPosition | null>(null);
   const [pressed, setPressed] = useState(false);
+  const [reactionBurst, setReactionBurst] = useState<{ id: number; emoji: string } | null>(null);
   const pressTimer = useRef<number | null>(null);
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  const originalScrollTop = useRef<number | null>(null);
+  const originalPaddingBottom = useRef<string | null>(null);
+  const paddingRestoreTimer = useRef<number | null>(null);
+  const reactionBurstTimer = useRef<number | null>(null);
+  const previousReaction = useRef(reaction);
+  const reactionBurstId = useRef(0);
+  const reactionPickerRef = useRef<HTMLDivElement>(null);
+  const actionMenuRef = useRef<HTMLDivElement>(null);
   const reactions = ["🤣", "❤️", "🥰", "😁", "💓", "👍", "🫂", "🔥"];
   const clearPressTimer = () => {
     if (pressTimer.current !== null) window.clearTimeout(pressTimer.current);
     pressTimer.current = null;
   };
+  const positionMessagePopups = (rect: DOMRect) => {
+    const margin = 12;
+    const gap = 8;
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const reactionWidth = Math.min(300, viewportWidth - margin * 2);
+    const reactionHeight = 56;
+    const actionWidth = Math.min(160, viewportWidth - margin * 2);
+    const actionHeight = mine ? 124 : 88;
+    const clamp = (value: number, min: number, max: number) =>
+      Math.min(Math.max(value, min), Math.max(min, max));
+    const reactionLeft = clamp(
+      mine ? rect.right - reactionWidth : rect.left,
+      margin,
+      viewportWidth - reactionWidth - margin,
+    );
+    const reactionAbove = rect.top - reactionHeight - gap >= margin;
+    const reactionTop = clamp(
+      reactionAbove ? rect.top - reactionHeight - gap : rect.bottom + gap,
+      margin,
+      viewportHeight - reactionHeight - margin,
+    );
+
+    const actionFitsBelow = rect.bottom + gap + actionHeight <= viewportHeight - margin;
+    let actionLeft: number;
+    let actionTop: number;
+    if (actionFitsBelow) {
+      actionLeft = clamp(
+        mine ? rect.right - actionWidth : rect.left,
+        margin,
+        viewportWidth - actionWidth - margin,
+      );
+      actionTop = rect.bottom + gap;
+    } else {
+      const rightSpace = viewportWidth - rect.right;
+      const leftSpace = rect.left;
+      const placeRight = rightSpace >= actionWidth + gap || rightSpace >= leftSpace;
+      actionLeft = clamp(
+        placeRight ? rect.right + gap : rect.left - actionWidth - gap,
+        margin,
+        viewportWidth - actionWidth - margin,
+      );
+      actionTop = clamp(
+        rect.top + (rect.height - actionHeight) / 2,
+        margin,
+        viewportHeight - actionHeight - margin,
+      );
+    }
+
+    setPopupPosition({
+      reactionTop,
+      reactionLeft,
+      actionTop,
+      actionLeft,
+      reactionWidth,
+      actionHeight,
+    });
+    setPressed(true);
+    setReactionMenuOpen(true);
+    setActionMenuOpen(Boolean(onReply));
+  };
+  const openMessagePopups = () => {
+    const bubble = bubbleRef.current;
+    if (!bubble) return;
+    const rect = bubble.getBoundingClientRect();
+    const scrollContainer = scrollContainerRef?.current;
+    const gap = 8;
+    const margin = 12;
+    const menuHeight = mine ? 124 : 88;
+    const neededShift = onReply
+      ? rect.bottom + gap + menuHeight + margin - window.innerHeight
+      : 0;
+
+    if (neededShift > 0 && scrollContainer) {
+      originalScrollTop.current = scrollContainer.scrollTop;
+      originalPaddingBottom.current = scrollContainer.style.paddingBottom;
+      const currentPadding = Number.parseFloat(
+        window.getComputedStyle(scrollContainer).paddingBottom,
+      ) || 0;
+      scrollContainer.style.paddingBottom = `${currentPadding + neededShift}px`;
+      if (neededShift > 0) {
+        if (paddingRestoreTimer.current !== null) {
+          window.clearTimeout(paddingRestoreTimer.current);
+          paddingRestoreTimer.current = null;
+        }
+        scrollContainer.scrollTop += neededShift;
+        window.requestAnimationFrame(() => {
+          const shiftedRect = bubble.getBoundingClientRect();
+          positionMessagePopups(shiftedRect);
+        });
+        return;
+      }
+    }
+
+    positionMessagePopups(rect);
+  };
   const startLongPress = () => {
     clearPressTimer();
-    pressTimer.current = window.setTimeout(() => {
-      setPressed(true);
-      setReactionMenuOpen(true);
-    }, 400);
+    pressTimer.current = window.setTimeout(openMessagePopups, 400);
+  };
+  const copyMessage = async () => {
+    try {
+      await navigator.clipboard.writeText(safeText);
+      toast.success("کۆپی کرا", {
+        icon: <CopyCheck className="size-4" />,
+        duration: 600,
+      });
+    } catch {
+      toast.error("نەتوانرا کۆپی بکرێت");
+    }
   };
   const chooseReaction = (nextReaction: string) => {
-    if (messageId) onReaction?.(messageId, nextReaction);
-    setReactionMenuOpen(false);
-    setPressed(false);
+    if (messageId) {
+      void Promise.resolve(
+        onReaction?.(messageId, reaction === nextReaction ? null : nextReaction),
+      ).catch((error: unknown) => {
+        console.error("Supabase direct-message reaction update error:", error);
+        toast.error("نەتوانرا ڕیاکتەکە نوێ بکرێتەوە");
+      });
+    }
+    closeMessagePopups();
   };
+  const restoreScrollPosition = useCallback(
+    (smooth = true) => {
+      const scrollContainer = scrollContainerRef?.current;
+      if (scrollContainer && originalScrollTop.current !== null) {
+        scrollContainer.scrollTo({
+          top: originalScrollTop.current,
+          behavior: smooth ? "smooth" : "auto",
+        });
+        const originalPadding = originalPaddingBottom.current ?? "";
+        if (paddingRestoreTimer.current !== null) {
+          window.clearTimeout(paddingRestoreTimer.current);
+        }
+        if (smooth) {
+          paddingRestoreTimer.current = window.setTimeout(() => {
+            if (scrollContainerRef?.current) {
+              scrollContainerRef.current.style.paddingBottom = originalPadding;
+            }
+            paddingRestoreTimer.current = null;
+          }, 250);
+        } else {
+          scrollContainer.style.paddingBottom = originalPadding;
+        }
+      }
+      originalScrollTop.current = null;
+      originalPaddingBottom.current = null;
+    },
+    [scrollContainerRef],
+  );
+  const closeMessagePopups = useCallback(() => {
+    setReactionMenuOpen(false);
+    setActionMenuOpen(false);
+    setPressed(false);
+    setPopupPosition(null);
+    restoreScrollPosition();
+  }, [restoreScrollPosition]);
+  useEffect(() => {
+    if (reaction !== previousReaction.current && reaction) {
+      reactionBurstId.current += 1;
+      setReactionBurst({ id: reactionBurstId.current, emoji: reaction });
+      if (reactionBurstTimer.current !== null) {
+        window.clearTimeout(reactionBurstTimer.current);
+      }
+      reactionBurstTimer.current = window.setTimeout(() => {
+        setReactionBurst(null);
+        reactionBurstTimer.current = null;
+      }, 700);
+    }
+    previousReaction.current = reaction;
+  }, [reaction]);
+  useEffect(() => {
+    if (!reactionMenuOpen && !actionMenuOpen) return;
+    const dismissOutside = (event: PointerEvent) => {
+      if (
+        !reactionPickerRef.current?.contains(event.target as Node) &&
+        !actionMenuRef.current?.contains(event.target as Node) &&
+        !bubbleRef.current?.contains(event.target as Node)
+      ) {
+        closeMessagePopups();
+        clearPressTimer();
+      }
+    };
+    document.addEventListener("pointerdown", dismissOutside);
+    return () => document.removeEventListener("pointerdown", dismissOutside);
+  }, [actionMenuOpen, closeMessagePopups, reactionMenuOpen]);
+  useEffect(
+    () => () => {
+      clearPressTimer();
+      restoreScrollPosition(false);
+      if (paddingRestoreTimer.current !== null) {
+        window.clearTimeout(paddingRestoreTimer.current);
+      }
+      if (reactionBurstTimer.current !== null) {
+        window.clearTimeout(reactionBurstTimer.current);
+      }
+    },
+    [restoreScrollPosition],
+  );
 
   return (
     <div className={`flex flex-col ${mine ? "items-start" : "items-end"}`}>
       {author && <span className="mb-0.5 text-[10px] text-panel-muted">{author}</span>}
       <div className="relative max-w-[75%]">
-        {reactionMenuOpen && (
-          <div className="absolute bottom-full z-20 mb-2 flex items-center gap-1 rounded-full border border-white/15 bg-background/80 px-2 py-1.5 shadow-xl backdrop-blur-md">
-            {reactions.map((emoji) => (
-              <button
-                key={emoji}
-                type="button"
-                onClick={() => chooseReaction(emoji)}
-                className="flex size-8 items-center justify-center rounded-full text-lg transition-transform hover:scale-125"
-                aria-label={`react ${emoji}`}
-              >
-                {emoji}
-              </button>
-            ))}
-          </div>
-        )}
         <div
+          ref={bubbleRef}
           onPointerDown={startLongPress}
           onPointerUp={clearPressTimer}
+          onPointerCancel={clearPressTimer}
           onPointerLeave={clearPressTimer}
+          onContextMenu={(event) => event.preventDefault()}
           onDoubleClick={() => chooseReaction("❤️")}
-          className={`rounded-2xl px-3.5 py-2.5 text-sm transition-transform duration-200 ${pressed ? "scale-[1.04]" : ""} ${
+          className={`rounded-2xl px-4 py-3 text-base transition-transform duration-200 ${pressed ? "scale-[1.04]" : ""} ${
           mine
             ? "bg-primary text-primary-foreground"
             : accent
@@ -468,6 +714,12 @@ function ChatBubble({
               : "bg-panel-foreground/5 text-panel-foreground"
           }`}
         >
+        {replyText && (
+          <div className="mb-1.5 max-w-full rounded-t-lg border-b border-white/10 bg-muted/40 p-1.5 text-xs text-panel-foreground/80">
+            {replyAuthor && <p className="mb-0.5 font-bold">{replyAuthor}</p>}
+            <p className="truncate">{replyText}</p>
+          </div>
+        )}
         {imageUrl && (
           <img
             src={imageUrl}
@@ -489,12 +741,106 @@ function ChatBubble({
           safeText
         )}
           {reaction && (
-            <span className="absolute -bottom-3 right-2 animate-soft-in rounded-full border border-background bg-background px-1.5 py-0.5 text-sm shadow-md">
-              {reaction}
+            <span className="absolute -bottom-3 right-2 z-10 flex size-7 items-center justify-center">
+              <span className="relative flex size-7 items-center justify-center">
+                {reactionBurst && (
+                  <span key={reactionBurst.id} className="absolute inset-0" aria-hidden="true">
+                    {[0, 1, 2, 3, 4].map((particle) => (
+                      <span
+                        key={particle}
+                        className={`reaction-particle reaction-particle-${particle + 1}`}
+                      >
+                        {reactionBurst.emoji}
+                      </span>
+                    ))}
+                  </span>
+                )}
+                <span className="relative z-10 text-lg leading-none">
+                  {reaction}
+                </span>
+              </span>
             </span>
           )}
         </div>
       </div>
+      {popupPosition && typeof document !== "undefined" &&
+        createPortal(
+          <>
+            {reactionMenuOpen && (
+              <div
+                ref={reactionPickerRef}
+                className="animate-in zoom-in-95 fixed z-[100] flex items-center gap-1 overflow-x-auto rounded-full border border-white/15 bg-background/90 px-2 py-1.5 shadow-xl backdrop-blur-md duration-150"
+                style={{
+                  top: popupPosition.reactionTop,
+                  left: popupPosition.reactionLeft,
+                  width: popupPosition.reactionWidth,
+                  maxWidth: "calc(100vw - 24px)",
+                }}
+              >
+                {reactions.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    onClick={() => chooseReaction(emoji)}
+                    className="flex size-8 shrink-0 items-center justify-center rounded-full text-lg transition-transform hover:scale-125"
+                    aria-label={`react ${emoji}`}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            )}
+            {actionMenuOpen && onReply && (
+              <div
+                ref={actionMenuRef}
+                className="animate-in zoom-in-95 fixed z-[100] flex min-w-36 flex-col overflow-hidden rounded-xl border border-panel-border bg-panel/95 p-1 shadow-xl backdrop-blur-md duration-150"
+                style={{
+                  top: popupPosition.actionTop,
+                  left: popupPosition.actionLeft,
+                  width: 160,
+                  maxHeight: "calc(100vh - 24px)",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    onReply();
+                    closeMessagePopups();
+                  }}
+                  className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold text-panel-foreground hover:bg-panel-foreground/10"
+                >
+                  <Reply className="size-4" />
+                  ڕیپلەی
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void copyMessage();
+                    closeMessagePopups();
+                  }}
+                  className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold text-panel-foreground hover:bg-panel-foreground/10"
+                >
+                  <Copy className="size-4" />
+                  کۆپی
+                </button>
+                {mine && onDelete && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onDelete();
+                      closeMessagePopups();
+                    }}
+                    className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold text-red-500 hover:bg-red-500/10"
+                  >
+                    <Trash2 className="size-4" />
+                    ڕەشکردنەوە
+                  </button>
+                )}
+              </div>
+            )}
+          </>,
+          document.body,
+        )}
       <span className="mt-1 text-[10px] text-panel-muted">
         {formatTime(typeof at === "number" ? at : Date.now())}
       </span>
@@ -505,9 +851,13 @@ function ChatBubble({
 function Composer({
   onSend,
   allowImages = false,
+  replyingTo,
+  onCancelReply,
 }: {
   onSend: (text: string, imageUrl?: string) => void;
   allowImages?: boolean;
+  replyingTo?: { author: string; text: string } | null;
+  onCancelReply?: () => void;
 }) {
   const [text, setText] = useState("");
   const [imageUrl, setImageUrl] = useState<string | undefined>();
@@ -526,70 +876,129 @@ function Composer({
   };
 
   return (
-    <form onSubmit={handleSubmit} className="flex items-center gap-2 pt-3">
-      {allowImages && (
-        <>
-          <input
-            ref={fileRef}
-            type="file"
-            accept="image/*"
-            className="hidden"
-            onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (!file) return;
-              const reader = new FileReader();
-              reader.onload = () => setImageUrl(String(reader.result));
-              reader.readAsDataURL(file);
-            }}
-          />
+    <form onSubmit={handleSubmit} className="flex flex-col gap-2 pt-3">
+      {replyingTo && (
+        <div className="flex items-center gap-2 rounded-xl border-r-2 border-primary bg-panel-foreground/5 px-3 py-2">
+          <div className="min-w-0 flex-1 text-right">
+            <p className="text-xs font-bold text-primary">{replyingTo.author}</p>
+            <p className="truncate text-xs text-panel-muted">{replyingTo.text}</p>
+          </div>
           <button
             type="button"
-            onClick={() => fileRef.current?.click()}
-            aria-label="ناردنی وێنە"
-            className="press flex size-11 items-center justify-center rounded-full border border-yellow-400/50 text-yellow-500"
+            onClick={onCancelReply}
+            aria-label="هەڵوەشاندنەوەی ڕیپلەی"
+            className="press flex size-8 shrink-0 items-center justify-center rounded-full text-panel-muted hover:bg-panel-foreground/10"
           >
-            <Image className="size-5" />
+            <X className="size-4" />
           </button>
-        </>
+        </div>
       )}
-      <input
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder="نامەیەک بنووسە..."
-        className="flex-1 rounded-2xl border border-panel-border bg-panel-foreground/5 px-4 py-3 text-sm text-panel-foreground outline-none placeholder:text-panel-muted focus:border-primary"
-      />
-      {canSend && (
-        <button
-          type="submit"
-          aria-label="ناردن"
-          className="press animate-soft-in flex size-12 items-center justify-center rounded-full bg-primary text-primary-foreground"
-        >
-          <Send className="size-5 -scale-x-100" />
-        </button>
-      )}
+      <div className="flex items-center gap-2">
+        {allowImages && (
+          <>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = () => setImageUrl(String(reader.result));
+                reader.readAsDataURL(file);
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              aria-label="ناردنی وێنە"
+              className="press flex size-11 items-center justify-center rounded-full border border-yellow-400/50 text-yellow-500"
+            >
+              <Image className="size-5" />
+            </button>
+          </>
+        )}
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="نامەیەک بنووسە..."
+          className="flex-1 rounded-2xl border border-panel-border bg-panel-foreground/5 px-4 py-3 text-sm text-panel-foreground outline-none placeholder:text-panel-muted focus:border-primary"
+        />
+        {canSend && (
+          <button
+            type="submit"
+            aria-label="ناردن"
+            className="press animate-soft-in flex size-12 items-center justify-center rounded-full bg-primary text-primary-foreground"
+          >
+            <Send className="size-5 -scale-x-100" />
+          </button>
+        )}
+      </div>
     </form>
   );
 }
 
+function useAutoScrollToLatest(messages: Message[], roomId: string) {
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const previousRoomId = useRef(roomId);
+
+  useLayoutEffect(() => {
+    const roomChanged = previousRoomId.current !== roomId;
+    messagesEndRef.current?.scrollIntoView({
+      behavior: roomChanged ? "auto" : "smooth",
+      block: "end",
+    });
+    previousRoomId.current = roomId;
+  }, [messages, roomId]);
+
+  return messagesEndRef;
+}
+
 function DirectChat({ friend, onClose }: { friend: Friend; onClose: () => void }) {
-  const { directMessages, sendDirect, markRead, reactToMessage, isProMember, user } = useApp();
+  const {
+    directMessages,
+    sendDirect,
+    deleteDirectMessage,
+    markRead,
+    reactToMessage,
+    isProMember,
+    user,
+    visibleFriends,
+  } = useApp();
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [replyingTo, setReplyingTo] = useState<{
+    id: string;
+    text: string;
+    author: string;
+    senderId: string;
+  } | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
   useHideChrome();
   const friendId = friend?.id;
   const messages =
     friendId && directMessages && typeof directMessages === "object"
       ? Array.isArray(directMessages[friendId])
         ? directMessages[friendId]
-        : []
-      : [];
+        : EMPTY_CHAT_MESSAGES
+      : EMPTY_CHAT_MESSAGES;
+  const messagesEndRef = useAutoScrollToLatest(messages, friendId ?? "");
+  const latestIncomingMessageId = [...messages]
+    .reverse()
+    .find((message) => message.senderId !== user?.id && message.senderId !== "me")?.id;
   useEffect(() => {
-    if (!friendId) return;
+    if (!friendId || !user?.id) return;
     try {
       markRead?.(friendId);
     } catch {
       // Keep an invalid persisted chat from taking down the route.
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [friendId]);
+  }, [friendId, latestIncomingMessageId]);
+
+  useEffect(() => {
+    if (friendId && !visibleFriends.some((item) => item.id === friendId)) onClose();
+  }, [friendId, onClose, visibleFriends]);
 
   if (!friendId) {
     return <EmptyChat onClose={onClose} label="هاوڕێیەک هەڵبژێرە" />;
@@ -598,15 +1007,20 @@ function DirectChat({ friend, onClose }: { friend: Friend; onClose: () => void }
   return (
     <div className="panel animate-soft-in fixed inset-0 z-50 flex w-screen flex-col px-4 pt-[max(1rem,env(safe-area-inset-top))] pb-[max(1rem,env(safe-area-inset-bottom))]">
       <div className="flex items-center justify-between pb-3">
-        <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={() => setProfileOpen(true)}
+          className="press flex min-w-0 items-center gap-3 text-right"
+          aria-label={`پرۆفایلی ${friend.name}`}
+        >
           <img
             src={renderProfilePic(friend)}
             onError={handleProfileImageError}
             alt={friend?.name ?? "هاوڕێ"}
             className="size-10 rounded-full bg-secondary"
           />
-          <span className="font-bold text-panel-foreground">{friend?.name ?? "هاوڕێ"}</span>
-        </div>
+          <span className="truncate font-bold text-panel-foreground">{friend?.name ?? "هاوڕێ"}</span>
+        </button>
         <button
           onClick={onClose}
           aria-label="گەڕانەوە"
@@ -616,7 +1030,10 @@ function DirectChat({ friend, onClose }: { friend: Friend; onClose: () => void }
         </button>
       </div>
 
-      <div className="flex-1 space-y-3 overflow-y-auto no-scrollbar py-2">
+      <div
+        ref={chatScrollRef}
+        className="min-h-0 flex-1 space-y-3 overflow-y-auto no-scrollbar py-2"
+      >
         {messages.length > 0 ? (
           messages.map((m) =>
             m?.id ? (
@@ -629,18 +1046,76 @@ function DirectChat({ friend, onClose }: { friend: Friend; onClose: () => void }
                 reaction={m?.reaction}
                 messageId={m?.id}
                 onReaction={reactToMessage}
+                replyText={m?.replyToText}
+                replyAuthor={
+                  m?.replyToSenderId
+                    ? m.replyToSenderId === user?.id
+                      ? "تۆ"
+                      : friend.name
+                    : undefined
+                }
+                onReply={() =>
+                  setReplyingTo({
+                    id: m.id,
+                    text: m.text || (m.imageUrl ? "وێنە" : ""),
+                    author: m.senderId === user?.id || m.senderId === "me" ? "تۆ" : friend.name,
+                    senderId: m.senderId,
+                  })
+                }
+                onDelete={
+                  m.senderId === user?.id || m.senderId === "me"
+                    ? () => {
+                        void deleteDirectMessage(friend.id, m.id).catch((error: unknown) => {
+                          console.error("Supabase direct-message deletion error:", error);
+                          toast.error("نەتوانرا نامەکە بسڕدرێتەوە");
+                        });
+                      }
+                    : undefined
+                }
+                scrollContainerRef={chatScrollRef}
               />
             ) : null,
           )
         ) : (
           <p className="pt-10 text-center text-sm text-panel-muted">هیچ نامەیەک نییە</p>
         )}
+        <div ref={messagesEndRef} className="h-px" aria-hidden="true" />
       </div>
 
       <Composer
         allowImages={isProMember}
-        onSend={(t, imageUrl) => sendDirect(friend.id, t, imageUrl)}
+        replyingTo={replyingTo}
+        onCancelReply={() => setReplyingTo(null)}
+        onSend={(t, imageUrl) => {
+          const reply = replyingTo
+            ? {
+                id: replyingTo.id,
+                text: replyingTo.text,
+                senderId: replyingTo.senderId,
+              }
+            : undefined;
+          setReplyingTo(null);
+          void sendDirect(friend.id, t, imageUrl, reply);
+        }}
       />
+      {profileOpen && (
+        <PlayerProfileSheet
+          player={friend}
+          followersCount={0}
+          followingCount={0}
+          allowFriendRequest={false}
+          showActions
+          onRemoved={() => {
+            setProfileOpen(false);
+            onClose();
+          }}
+          onBlocked={onClose}
+          onClose={() => {
+            setProfileOpen(false);
+            if (!visibleFriends.some((item) => item.id === friend.id)) onClose();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -670,7 +1145,8 @@ function GroupChat({ group, onClose }: { group: Group; onClose: () => void }) {
     typeof groupMessages === "object" &&
     Array.isArray(groupMessages[groupId])
       ? groupMessages[groupId]
-      : [];
+      : EMPTY_CHAT_MESSAGES;
+    const messagesEndRef = useAutoScrollToLatest(messages, groupId ?? "");
   const safeFriends = Array.isArray(friends) ? friends : [];
   const nameOf = (id: string) => safeFriends.find((f) => f?.id === id)?.name ?? "ئەندام";
 
@@ -705,7 +1181,7 @@ function GroupChat({ group, onClose }: { group: Group; onClose: () => void }) {
         </button>
       </div>
 
-      <div className="flex-1 space-y-3 overflow-y-auto no-scrollbar py-2">
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto no-scrollbar py-2">
         {messages.length > 0 ? (
           messages.map((m) =>
             m?.id ? (
@@ -722,6 +1198,7 @@ function GroupChat({ group, onClose }: { group: Group; onClose: () => void }) {
         ) : (
           <p className="pt-10 text-center text-sm text-panel-muted">هیچ نامەیەک نییە</p>
         )}
+        <div ref={messagesEndRef} className="h-px" aria-hidden="true" />
       </div>
 
       <Composer onSend={(t) => sendGroup(group.id, t)} />
@@ -731,12 +1208,14 @@ function GroupChat({ group, onClose }: { group: Group; onClose: () => void }) {
 
 function FriendRequests({
   requests,
+  currentUserId,
   onClose,
   onStatusChange,
 }: {
   requests: DatabaseFriendRequest[];
+  currentUserId?: string | undefined;
   onClose: () => void;
-  onStatusChange: (requestId: string, status: "accepted" | "rejected", friend: Friend) => void;
+  onStatusChange: (requestId: string, friend: Friend) => void;
 }) {
   useHideChrome();
 
@@ -765,7 +1244,7 @@ function FriendRequests({
               src={renderProfilePic(r)}
               onError={handleProfileImageError}
               alt={r.name ?? "هاوڕێ"}
-              className="size-12 rounded-full bg-secondary"
+              className={`size-12 rounded-full bg-secondary ring-2 ${r.online === false ? "ring-slate-400/60" : "ring-emerald-400/80 shadow-[0_0_12px_rgba(52,211,153,0.3)]"}`}
             />
             <div className="flex-1 text-right">
               <p className="font-bold text-panel-foreground">{r.name}</p>
@@ -775,46 +1254,30 @@ function FriendRequests({
               <button
                 onClick={() => {
                   if (!supabase) return;
-                  void supabase
-                    .from("friend_requests")
-                    .update({ status: "accepted" })
-                    .eq("id", requestId)
-                    .then(({ error }) => {
+                  void (async () => {
+                    try {
+                      const { error } = await supabase.rpc("accept_friend_request", {
+                        request_id: requestId,
+                        sender_user_id: r.id,
+                        receiver_user_id: currentUserId,
+                      });
                       if (error) {
                         toast.error("نەتوانرا زیاد بکرێت");
                         return;
                       }
-                      onStatusChange(requestId, "accepted", r);
+                      onStatusChange(requestId, r);
                       toast.success("زیادکرا");
-                    });
+                    } catch (error) {
+                      console.error("Friend request accept failed:", error);
+                      toast.error("نەتوانرا زیاد بکرێت");
+                    }
+                  })();
                 }}
-                aria-label="زیادکردن"
-                className="press flex items-center gap-1 rounded-2xl border border-primary/40 bg-primary/15 px-3 py-2 text-sm font-bold text-emerald-700 backdrop-blur-md"
+                aria-label="قەبوڵکردن"
+                className="press flex items-center gap-1 rounded-2xl border border-emerald-400/40 bg-emerald-500/15 px-3 py-2 text-sm font-bold text-emerald-300 backdrop-blur-md"
               >
                 <Check className="size-4" />
-                زیادکردن
-              </button>
-              <button
-                onClick={() => {
-                  if (!supabase) return;
-                  void supabase
-                    .from("friend_requests")
-                    .update({ status: "rejected" })
-                    .eq("id", requestId)
-                    .then(({ error }) => {
-                      if (error) {
-                        toast.error("نەتوانرا ڕەت بکرێتەوە");
-                        return;
-                      }
-                      onStatusChange(requestId, "rejected", r);
-                      toast("ڕەتکرایەوە");
-                    });
-                }}
-                aria-label="ڕەتکردنەوە"
-                className="press flex items-center gap-1 rounded-2xl border border-destructive/40 bg-destructive/15 px-3 py-2 text-sm font-bold text-destructive backdrop-blur-md"
-              >
-                <X className="size-4" />
-                ڕەتکردنەوە
+                قەبوڵکردن
               </button>
             </div>
           </div>

@@ -10,7 +10,11 @@ export function GameStarter({ stickers = [], customBoards = [] }: { stickers?: a
 
   // تێکەڵکردنی تەختە بنەڕەتییەکان و تەختە نوێیەکانی سۆپابەیس
   const allBoards = [...defaultBoards, ...customBoards];
-  const board = allBoards.find((b) => b.id === boardId) || defaultBoards[0];
+  const board = allBoards.find((b) => b.id === boardId) || defaultBoards[0] || {
+    id: "",
+    name: "",
+    colors: ["#ffffff", "#ffffff", "#ffffff"] as [string, string, string],
+  };
 
   return (
     <>
