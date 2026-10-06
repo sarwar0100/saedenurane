@@ -43,6 +43,8 @@ export type GamePlayer = {
   color: PlayerColor;
   isHuman: boolean;
   position: number; // 0 = not yet on the board
+  score?: number;
+  connected?: boolean;
   token_url?: string;
   kicked?: boolean;
 };

@@ -1,11 +1,7 @@
 import { useState, useEffect } from "react";
 import { ArrowRight, Plus, Trash2, Volume2, Sticker, LayoutGrid, User } from "lucide-react";
 import { useHideChrome } from "@/components/chrome";
-import { createClient } from "@supabase/supabase-js";
-
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || "";
-const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || "";
-const supabase = createClient(supabaseUrl, supabaseKey);
+import { supabase } from "@/lib/supabase";
 
 export function AdminPanel({ onClose }: { onClose: () => void }) {
   useHideChrome();
@@ -21,6 +17,7 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
   }, [tab]);
 
   const fetchItems = async () => {
+    if (!supabase) return;
     const { data } = await supabase.from(tab).select("*");
     if (data) setItems(data);
     else setItems([]);
@@ -28,6 +25,7 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
 
   const handleAdd = async () => {
     if (!name || !url) return alert("تکایە ناو و لینک بنووسە");
+    if (!supabase) return alert("Supabase connection is unavailable");
     setLoading(true);
 
     const itemPrice = parseInt(price) || 0;
@@ -49,6 +47,7 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
   };
 
   const handleDelete = async (id: number | string) => {
+    if (!supabase) return;
     // ١. ڕاستەوخۆ لە ڕووکارەکە (UI) دەیسڕێتەوە تا کات نەیبات و بەبێ پرسیار ڕەش بێتەوە
     setItems((prev) => prev.filter((item) => item.id !== id));
 

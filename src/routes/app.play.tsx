@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useState, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { ArrowRight, Volume2, Sticker, LayoutGrid, Castle, Settings, Play, Coins, Plus, Search, Loader2, X, Crown, UserPlus, Users } from "lucide-react";
@@ -8,7 +8,6 @@ import { avatarImageSource, useApp, userStorageKey, type Friend } from "@/lib/ap
 import { supabase } from "@/lib/supabase";
 import { useHideChrome } from "@/components/chrome";
 import { AdminPanel } from "@/components/AdminPanel";
-import { SnakesGame } from "@/components/SnakesGame";
 import { GoldBar } from "@/components/GoldBar";
 import { toast } from "sonner";
 
@@ -22,7 +21,15 @@ type StickerItem = {
   price?: number | string | null;
 };
 
-type LobbyPlayer = { id: string; name: string; avatar: string; token_url?: string };
+type LobbyPlayer = {
+  id: string;
+  name: string;
+  avatar: string;
+  token_url?: string;
+  connected?: boolean;
+  score?: number;
+  position?: number;
+};
 type LobbyMember = LobbyPlayer & { isHost: boolean };
 type LobbySession = { id: string; hostId: string; maxPlayers: 2 | 3 | 4; isHost: boolean };
 type LobbyMatchConfig = {
@@ -36,6 +43,23 @@ type QuickMatchQueueResult = {
   status: "waiting" | "matched";
   match_config?: LobbyMatchConfig | null;
   lobby_created_at?: string;
+  game_session?: {
+    game_id: string;
+    lobby_id: string;
+    launch_reason: "full" | "timer" | "host";
+    board: LobbyMatchConfig["board"];
+    players: LobbyPlayer[];
+    turn_index: number;
+  } | null;
+};
+type QuickMatchRoomState = {
+  roomId: string | null;
+  players: LobbyPlayer[];
+  status: "waiting" | "matched" | "in_progress" | null;
+  countdown: number;
+  maxPlayers: 4;
+  matchId: string | null;
+  createdAt: string | null;
 };
 type GameInvitation = { id: string; lobby_id: string; sender_id: string; receiver_id: string; status: string };
 type IncomingLobbyInvitation = { invitation: GameInvitation; sender: LobbyPlayer; maxPlayers: 2 | 3 | 4 };
@@ -84,6 +108,33 @@ async function loadLobbyMembers(lobbyId: string, hostId: string): Promise<LobbyM
       avatar: profile?.avatar_url ?? "",
       ...(membership.token_url ? { token_url: membership.token_url } : {}),
       isHost: membership.user_id === hostId,
+    };
+  });
+}
+
+async function loadQuickMatchPlayers(lobbyId: string): Promise<LobbyPlayer[]> {
+  if (!supabase) return [];
+  const { data: memberships, error } = await supabase
+    .from("lobby_players")
+    .select("user_id, token_url, joined_at")
+    .eq("lobby_id", lobbyId)
+    .order("joined_at", { ascending: true });
+  if (error || !memberships?.length) return [];
+
+  const { data: profiles } = await supabase
+    .from("profiles")
+    .select("id, username, display_name, avatar_url, online, status")
+    .in("id", memberships.map((membership) => membership.user_id));
+  const profileById = new Map((profiles ?? []).map((profile) => [profile.id, profile]));
+
+  return memberships.map((membership) => {
+    const profile = profileById.get(membership.user_id);
+    return {
+      id: membership.user_id,
+      name: profile?.display_name ?? profile?.username ?? "یاریزان",
+      avatar: profile?.avatar_url ?? "",
+      ...(membership.token_url ? { token_url: membership.token_url } : {}),
+      connected: Boolean(profile?.online && profile.status === "online"),
     };
   });
 }
@@ -389,12 +440,21 @@ function PlayGameStarter({
 }) {
   const QUICK_MATCH_COUNTDOWN_SECONDS = 15;
   const { boardId, tokenId, user, visibleFriends } = useApp();
-  const [playing, setPlaying] = useState(false);
-  const [quickMatchWaiting, setQuickMatchWaiting] = useState(false);
-  const [quickMatchCountdown, setQuickMatchCountdown] = useState(QUICK_MATCH_COUNTDOWN_SECONDS);
-  const [quickMatchLobbyId, setQuickMatchLobbyId] = useState<string | null>(null);
-  const [quickMatchLobbyCreatedAt, setQuickMatchLobbyCreatedAt] = useState<string | null>(null);
-  const [quickMatchPlayers, setQuickMatchPlayers] = useState<LobbyPlayer[]>([]);
+  const navigate = useNavigate();
+  const [quickMatchRoom, setQuickMatchRoom] = useState<QuickMatchRoomState>({
+    roomId: null,
+    players: [],
+    status: null,
+    countdown: QUICK_MATCH_COUNTDOWN_SECONDS,
+    maxPlayers: 4,
+    matchId: null,
+    createdAt: null,
+  });
+  const quickMatchWaiting = quickMatchRoom.status === "waiting";
+  const quickMatchCountdown = quickMatchRoom.countdown;
+  const quickMatchLobbyId = quickMatchRoom.roomId;
+  const quickMatchLobbyCreatedAt = quickMatchRoom.createdAt;
+  const quickMatchPlayers = quickMatchRoom.players;
   const [friendsLobbyOpen, setFriendsLobbyOpen] = useState(false);
   const [lobbyMatch, setLobbyMatch] = useState<LobbyMatchConfig | null>(null);
   const [lobbySession, setLobbySession] = useState<LobbySession | null>(null);
@@ -406,16 +466,28 @@ function PlayGameStarter({
   const quickMatchStartPending = useRef(false);
   const quickMatchJoinPending = useRef(false);
   const quickMatchCancelRequested = useRef(false);
+  const launchedMatchIdRef = useRef<string | null>(null);
   const quickMatchCountdownRef = useRef(QUICK_MATCH_COUNTDOWN_SECONDS);
-  const quickMatchPlayersRef = useRef(quickMatchPlayers);
-  const departedQuickMatchPlayersRef = useRef(new Set<string>());
   const quickMatchWaitingRef = useRef(quickMatchWaiting);
   const quickMatchLobbyIdRef = useRef(quickMatchLobbyId);
-  const quickMatchQueueChannelRef = useRef<ReturnType<NonNullable<typeof supabase>["channel"]> | null>(null);
   const quickMatchLobbyChannelRef = useRef<ReturnType<NonNullable<typeof supabase>["channel"]> | null>(null);
-  const quickMatchPresenceChannelRef = useRef<ReturnType<NonNullable<typeof supabase>["channel"]> | null>(null);
+  const setQuickMatchWaiting = useCallback((waiting: boolean) => {
+    setQuickMatchRoom((room) => ({ ...room, status: waiting ? "waiting" : room.matchId ? "in_progress" : null }));
+  }, []);
+  const setQuickMatchCountdown = useCallback((countdown: number) => {
+    quickMatchCountdownRef.current = countdown;
+    setQuickMatchRoom((room) => ({ ...room, countdown }));
+  }, []);
+  const setQuickMatchLobbyId = useCallback((roomId: string | null) => {
+    setQuickMatchRoom((room) => ({ ...room, roomId }));
+  }, []);
+  const setQuickMatchLobbyCreatedAt = useCallback((createdAt: string | null) => {
+    setQuickMatchRoom((room) => ({ ...room, createdAt }));
+  }, []);
+  const setQuickMatchPlayers = useCallback((players: LobbyPlayer[]) => {
+    setQuickMatchRoom((room) => ({ ...room, players }));
+  }, []);
   visibleFriendsRef.current = visibleFriends;
-  quickMatchPlayersRef.current = quickMatchPlayers;
   quickMatchWaitingRef.current = quickMatchWaiting;
   quickMatchLobbyIdRef.current = quickMatchLobbyId;
 
@@ -573,6 +645,8 @@ function PlayGameStarter({
   };
 
   const startSharedMatch = useCallback((match: LobbyMatchConfig) => {
+    if (!match.gameId || launchedMatchIdRef.current === match.gameId) return;
+    launchedMatchIdRef.current = match.gameId;
     setLobbyMatch((current) => current?.gameId === match.gameId ? current : match);
     setLobbySession({
       id: match.lobbyId,
@@ -582,31 +656,43 @@ function PlayGameStarter({
     });
     setQuickMatchWaiting(false);
     setQuickMatchPlayers([]);
+    setQuickMatchRoom((room) => ({ ...room, status: "in_progress", matchId: match.gameId }));
     setFriendsLobbyOpen(false);
-    setPlaying(true);
     window.dispatchEvent(new Event("hide-gold-counter"));
-  }, [user?.id]);
+    void navigate({ to: "/game/$matchId", params: { matchId: match.gameId } });
+  }, [navigate, user?.id]);
 
   const launchQuickMatchIfEligible = useCallback((
     status: string,
     match: LobbyMatchConfig | null | undefined,
+    session: QuickMatchQueueResult["game_session"],
   ) => {
     if (!match || !quickMatchWaitingRef.current || quickMatchCancelRequested.current) return false;
-    const activePlayers = quickMatchPlayersRef.current
-      .filter((player) => !departedQuickMatchPlayersRef.current.has(player.id))
-      .slice(0, 4);
-    const playerCount = activePlayers.length;
-    const serverStartedMatch = status === "matched" || status === "in_progress";
-    if (!serverStartedMatch || quickMatchCountdownRef.current > 0 || playerCount < 2) return false;
-    startSharedMatch({ ...match, players: activePlayers });
+    const activePlayers = session?.players.filter((player) => player.connected === true) ?? [];
+    if (
+      status !== "matched"
+      || !session
+      || (session.launch_reason !== "full" && session.launch_reason !== "timer")
+      || session.game_id !== match.gameId
+      || activePlayers.length < 2
+      || activePlayers.length > 4
+    ) return false;
+    startSharedMatch({
+      ...match,
+      gameId: session.game_id,
+      lobbyId: session.lobby_id,
+      board: session.board,
+      players: session.players,
+    });
     return true;
   }, [startSharedMatch]);
 
-  const leaveQuickMatchRpc = useCallback(async (lobbyId: string | null) => {
+  const leaveQuickMatchRpc = useCallback(async (lobbyId: string | null, keepRoom = false) => {
     if (!supabase || !user?.id) return false;
     const { error } = await supabase.rpc("leave_quick_match", {
       p_lobby_id: lobbyId,
       p_player_id: user.id,
+      p_keep_room: keepRoom,
     });
     if (error) {
       console.error("Quick match leave failed:", error);
@@ -622,46 +708,33 @@ function PlayGameStarter({
         storage.removeItem("active_quick_match_lobby");
       }
     }
-    setQuickMatchWaiting(false);
-    setQuickMatchPlayers([]);
-    setQuickMatchLobbyId(null);
-    setQuickMatchLobbyCreatedAt(null);
-    departedQuickMatchPlayersRef.current.clear();
-    quickMatchCountdownRef.current = QUICK_MATCH_COUNTDOWN_SECONDS;
-    setQuickMatchCountdown(QUICK_MATCH_COUNTDOWN_SECONDS);
+    setQuickMatchRoom({
+      roomId: null,
+      players: [],
+      status: null,
+      countdown: QUICK_MATCH_COUNTDOWN_SECONDS,
+      maxPlayers: 4,
+      matchId: null,
+      createdAt: null,
+    });
   }, []);
 
   const removeQuickMatchChannels = useCallback(() => {
     if (!supabase) return;
-    const channels = [
-      quickMatchQueueChannelRef.current,
-      quickMatchLobbyChannelRef.current,
-      quickMatchPresenceChannelRef.current,
-    ];
-    quickMatchQueueChannelRef.current = null;
+    const channel = quickMatchLobbyChannelRef.current;
     quickMatchLobbyChannelRef.current = null;
-    quickMatchPresenceChannelRef.current = null;
-    for (const channel of channels) {
-      if (channel) void supabase.removeChannel(channel);
-    }
+    if (channel) void supabase.removeChannel(channel);
   }, []);
 
-  const applyQuickMatchRoster = useCallback((players: LobbyPlayer[], restoreRejoinedPlayers = false) => {
-    if (restoreRejoinedPlayers) {
-      players.forEach((player) => departedQuickMatchPlayersRef.current.delete(player.id));
-    }
-    const activePlayers = players.filter((player) => !departedQuickMatchPlayersRef.current.has(player.id));
-    quickMatchPlayersRef.current = activePlayers;
-    setQuickMatchPlayers(activePlayers);
-    return activePlayers;
+  const applyQuickMatchRoster = useCallback((players: LobbyPlayer[]) => {
+    setQuickMatchPlayers(players);
+    return players;
   }, []);
 
   useEffect(() => () => {
     if (!quickMatchWaitingRef.current) return;
-    const presenceChannel = quickMatchPresenceChannelRef.current;
-    if (presenceChannel) void presenceChannel.untrack();
     removeQuickMatchChannels();
-    void leaveQuickMatchRpc(quickMatchLobbyIdRef.current);
+    void leaveQuickMatchRpc(quickMatchLobbyIdRef.current, true);
   }, [leaveQuickMatchRpc, removeQuickMatchChannels]);
 
   const tryStartQuickMatch = useCallback(async () => {
@@ -669,7 +742,7 @@ function PlayGameStarter({
     if (!client || !user?.id || quickMatchStartPending.current || !quickMatchWaitingRef.current || quickMatchCancelRequested.current) return;
     quickMatchStartPending.current = true;
     try {
-      const { data, error } = await client.rpc("start_quick_match");
+      const { data, error } = await client.rpc("launch_quick_match");
       if (error) {
         console.error("Quick match start check failed:", error);
         if (error.code === "PGRST202") {
@@ -678,10 +751,10 @@ function PlayGameStarter({
         return;
       }
       const result = data as QuickMatchQueueResult;
-      if (result.match_config?.players) applyQuickMatchRoster(result.match_config.players, true);
+      if (result.match_config?.players) applyQuickMatchRoster(result.match_config.players);
       if (result.match_config?.lobbyId) setQuickMatchLobbyId(result.match_config.lobbyId);
       if (result.lobby_created_at) setQuickMatchLobbyCreatedAt(result.lobby_created_at);
-      launchQuickMatchIfEligible(result.status, result.match_config);
+      launchQuickMatchIfEligible(result.status, result.match_config, result.game_session);
     } finally {
       quickMatchStartPending.current = false;
     }
@@ -689,37 +762,21 @@ function PlayGameStarter({
 
   const startLobbyGame = async (members: LobbyMember[]) => {
     if (!supabase || !lobbySession?.isHost || members.length < 2) return;
-    const gameId = crypto.randomUUID();
-    const match: LobbyMatchConfig = {
-      gameId,
-      lobbyId: lobbySession.id,
-      hostId: lobbySession.hostId,
-      board: { ...selectedBoard },
-      players: members.slice(0, lobbySession.maxPlayers).map((member) => ({
-        id: member.id,
-        name: member.name,
-        avatar: member.avatar,
-        ...(member.token_url ? { token_url: member.token_url } : {}),
-      })),
-    };
-    const { data: updatedLobby, error } = await supabase
-      .from("game_lobbies")
-      .update({ status: "in_progress", game_id: gameId, match_config: match })
-      .eq("id", lobbySession.id)
-      .eq("host_id", user?.id)
-      .eq("status", "waiting")
-      .select("game_id")
-      .maybeSingle();
-    if (error || !updatedLobby) {
+    const { data, error } = await supabase.rpc("launch_friend_lobby", {
+      p_lobby_id: lobbySession.id,
+      p_board: selectedBoard,
+    });
+    const result = data as { match_config?: LobbyMatchConfig } | null;
+    if (error || !result?.match_config) {
       toast.error("نەتوانرا یاری دەست پێ بکات");
       console.error("Lobby start failed:", error ?? "Lobby is no longer waiting");
       return;
     }
-    startSharedMatch(match);
+    startSharedMatch(result.match_config);
   };
 
   const joinQuickMatch = async () => {
-    if (!supabase || !user?.id || quickMatchWaiting || playing || quickMatchJoinPending.current) return;
+    if (!supabase || !user?.id || quickMatchWaiting || quickMatchJoinPending.current) return;
     if (typeof window !== "undefined") {
       for (const storage of [window.localStorage, window.sessionStorage]) {
         storage.removeItem("active_lobby_id");
@@ -728,34 +785,30 @@ function PlayGameStarter({
     }
     quickMatchJoinPending.current = true;
     quickMatchCancelRequested.current = false;
-    departedQuickMatchPlayersRef.current.clear();
-    const localPlayer = {
-      id: user.id,
-      name: user.name,
-      avatar: user.avatar,
-      ...(selectedToken?.image_url ? { token_url: selectedToken.image_url } : {}),
-    };
-    quickMatchPlayersRef.current = [localPlayer];
-    quickMatchCountdownRef.current = QUICK_MATCH_COUNTDOWN_SECONDS;
+    launchedMatchIdRef.current = null;
+    setQuickMatchRoom({
+      roomId: null,
+      players: [],
+      status: null,
+      countdown: QUICK_MATCH_COUNTDOWN_SECONDS,
+      maxPlayers: 4,
+      matchId: null,
+      createdAt: null,
+    });
     setQuickMatchCountdown(QUICK_MATCH_COUNTDOWN_SECONDS);
-    setQuickMatchLobbyId(null);
-    setQuickMatchLobbyCreatedAt(null);
-    setQuickMatchPlayers([localPlayer]);
-    setQuickMatchWaiting(true);
     try {
-      const previousQueueCleared = await leaveQuickMatchRpc(null);
-      if (!previousQueueCleared) {
-        setQuickMatchWaiting(false);
-        setQuickMatchPlayers([]);
-        toast.error("نەتوانرا گەڕانی پێشووی یاری پاک بکرێتەوە");
-        return;
-      }
+      const { data: reconnectData, error: reconnectError } = await supabase.rpc("rejoin_quick_match");
+      if (reconnectError) console.warn("Quick-match room recovery failed:", reconnectError.message);
       if (quickMatchCancelRequested.current) return;
 
-      const { data, error } = await supabase.rpc("find_or_create_quick_match", {
-        requested_board: normalizeBoardSkin(selectedBoard),
-        requested_token_url: selectedToken?.image_url ?? null,
-      });
+      const recovered = reconnectData as QuickMatchQueueResult & { status?: string } | null;
+      const recoveredLobbyId = recovered?.match_config?.lobbyId;
+      const { data, error } = recovered?.status === "waiting" && recoveredLobbyId
+        ? { data: reconnectData, error: null }
+        : await supabase.rpc("join_quick_match", {
+          requested_board: selectedBoard,
+          requested_token_url: selectedToken?.image_url ?? null,
+        });
       if (quickMatchCancelRequested.current) {
         await leaveQuickMatchRpc(null);
         return;
@@ -768,11 +821,13 @@ function PlayGameStarter({
       }
       const result = data as QuickMatchQueueResult;
       const lobbyId = result.match_config?.lobbyId;
+      if (result.match_config?.players) applyQuickMatchRoster(result.match_config.players);
       if (lobbyId) {
         setQuickMatchLobbyId(lobbyId);
+        setQuickMatchWaiting(true);
         const { data: lobby } = await supabase
           .from("game_lobbies")
-          .select("created_at, status, match_config")
+          .select("created_at, status, game_id, match_config")
           .eq("id", lobbyId)
           .maybeSingle();
         if (quickMatchCancelRequested.current) {
@@ -785,19 +840,21 @@ function PlayGameStarter({
             0,
             QUICK_MATCH_COUNTDOWN_SECONDS - Math.floor((Date.now() - new Date(lobby.created_at).getTime()) / 1000),
           );
-          quickMatchCountdownRef.current = remaining;
           setQuickMatchCountdown(remaining);
+          setQuickMatchRoom((room) => ({
+            ...room,
+            status: lobby.status === "matched" || lobby.status === "in_progress" ? lobby.status : "waiting",
+            matchId: lobby.game_id,
+          }));
         }
-        if (lobby?.status === "in_progress" && lobby.match_config) {
+        if (lobby?.status === "in_progress" || lobby?.status === "matched") {
           void tryStartQuickMatch();
           return;
         }
+        applyQuickMatchRoster(await loadQuickMatchPlayers(lobbyId));
       }
-      if (result.match_config?.players) applyQuickMatchRoster(result.match_config.players, true);
-      if ((result.match_config?.players.length ?? 0) === 4 || result.status === "matched") {
-        launchQuickMatchIfEligible(result.status, result.match_config);
-        if (result.status !== "matched") void tryStartQuickMatch();
-        return;
+      if ((result.match_config?.players.length ?? 0) >= 4 || result.status === "matched") {
+        void tryStartQuickMatch();
       }
     } finally {
       quickMatchJoinPending.current = false;
@@ -806,125 +863,43 @@ function PlayGameStarter({
 
   useEffect(() => {
     const client = supabase;
-    if (!quickMatchWaiting || !client || !user?.id) return;
-    let active = true;
-    const acceptQueueUpdate = (status: string, config: LobbyMatchConfig | null | undefined) => {
-      if (!active || !config || (status !== "waiting" && status !== "matched")) return;
-      if (config.lobbyId) setQuickMatchLobbyId(config.lobbyId);
-      if (status === "matched") {
-        void tryStartQuickMatch();
-        return;
-      }
-      if (config.players?.length === 4) {
-        void tryStartQuickMatch();
-        return;
-      }
-      if (launchQuickMatchIfEligible(status, config)) return;
-    };
-    const refreshOwnQueue = () => {
-      void client
-        .from("quick_match_queue")
-        .select("status, match_config")
-        .eq("user_id", user.id)
-        .maybeSingle()
-        .then(({ data: queueRow }) => {
-          if (queueRow) acceptQueueUpdate(queueRow.status, queueRow.match_config as LobbyMatchConfig | null);
-        });
-    };
-    const handleQueueDelete = (oldRow: Record<string, unknown>) => {
-      const departedId = typeof oldRow["user_id"] === "string" ? oldRow["user_id"] : null;
-      const deletedLobbyId = typeof oldRow["lobby_id"] === "string" ? oldRow["lobby_id"] : null;
-      if (
-        !departedId
-        || (deletedLobbyId && quickMatchLobbyId && deletedLobbyId !== quickMatchLobbyId)
-      ) return;
-      departedQuickMatchPlayersRef.current.add(departedId);
-      const activePlayers = quickMatchPlayersRef.current.filter((player) => player.id !== departedId);
-      quickMatchPlayersRef.current = activePlayers;
-      setQuickMatchPlayers(activePlayers);
-      refreshOwnQueue();
-    };
-    const channel = client
-      .channel(`quick-match:${user.id}`)
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "quick_match_queue", filter: `user_id=eq.${user.id}` },
-        ({ new: row }) => {
-          const queueRow = row as { status: string; match_config?: LobbyMatchConfig | null };
-          acceptQueueUpdate(queueRow.status, queueRow.match_config);
-        },
-      )
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "quick_match_queue", filter: `user_id=eq.${user.id}` },
-        ({ new: row }) => {
-          const queueRow = row as { status: string; match_config?: LobbyMatchConfig | null };
-          acceptQueueUpdate(queueRow.status, queueRow.match_config);
-        },
-      )
-      .on(
-        "postgres_changes",
-        { event: "DELETE", schema: "public", table: "quick_match_queue" },
-        ({ old: row }) => handleQueueDelete(row as Record<string, unknown>),
-      )
-      .subscribe((status) => {
-        if (status !== "SUBSCRIBED") return;
-        refreshOwnQueue();
-      });
-    quickMatchQueueChannelRef.current = channel;
-    return () => {
-      active = false;
-      if (quickMatchQueueChannelRef.current === channel) {
-        quickMatchQueueChannelRef.current = null;
-        void client.removeChannel(channel);
-      }
-    };
-  }, [quickMatchWaiting, launchQuickMatchIfEligible, tryStartQuickMatch, user?.id]);
-
-  useEffect(() => {
-    const client = supabase;
     if (!quickMatchWaiting || !client || !quickMatchLobbyId) return;
     let active = true;
-    const applyLobbySnapshot = (row: {
-      created_at: string;
-      status: string;
-      match_config: LobbyMatchConfig | null;
-    }, queueRows: Array<{ user_id: string; status: string }>) => {
+    const refreshLobbySnapshot = async () => {
+      const { data: lobby } = await client
+        .from("game_lobbies")
+        .select("created_at, status, game_id, match_config")
+        .eq("id", quickMatchLobbyId)
+        .maybeSingle();
+      if (!active || !lobby) return;
+      const players = await loadQuickMatchPlayers(quickMatchLobbyId);
       if (!active) return;
-      setQuickMatchLobbyCreatedAt(row.created_at);
-      const activeIds = new Set(
-        queueRows
-          .filter((queueRow) => queueRow.status === "waiting" || queueRow.status === "matched")
-          .map((queueRow) => queueRow.user_id),
-      );
-      const databaseRoster = Array.isArray(row.match_config?.players)
-        ? row.match_config.players.filter((player) => activeIds.has(player.id))
-        : [];
-      applyQuickMatchRoster(databaseRoster, true);
-      if (row.status === "in_progress" && !launchQuickMatchIfEligible(row.status, row.match_config)) {
-        void tryStartQuickMatch();
-      }
-    };
-    const refreshLobbySnapshot = () => {
-      void Promise.all([
-        client
-          .from("game_lobbies")
-          .select("created_at, status, match_config")
-          .eq("id", quickMatchLobbyId)
-          .maybeSingle(),
-        client
-          .from("quick_match_queue")
-          .select("user_id, status")
-          .eq("lobby_id", quickMatchLobbyId),
-      ]).then(([{ data: lobby }, { data: queueRows }]) => {
-        if (lobby) {
-          applyLobbySnapshot(lobby as {
-            created_at: string;
-            status: string;
-            match_config: LobbyMatchConfig | null;
-          }, queueRows ?? []);
+      const activePlayerCount = players.filter((player) => player.connected === true).length;
+      const createdAt = lobby.created_at;
+      const countdown = activePlayerCount < 2
+        ? QUICK_MATCH_COUNTDOWN_SECONDS
+        : Math.max(
+          0,
+          QUICK_MATCH_COUNTDOWN_SECONDS - Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000),
+        );
+      setQuickMatchLobbyCreatedAt(createdAt);
+      quickMatchCountdownRef.current = countdown;
+      setQuickMatchCountdown(countdown);
+      applyQuickMatchRoster(players);
+
+      const matchConfig = lobby.match_config as LobbyMatchConfig | null;
+      setQuickMatchRoom((room) => ({
+        ...room,
+        status: lobby.status === "matched" || lobby.status === "in_progress" ? lobby.status : "waiting",
+        matchId: lobby.game_id,
+      }));
+      if (matchConfig && lobby.game_id) {
+        if (lobby.status === "matched" || lobby.status === "in_progress") {
+          void tryStartQuickMatch();
+        } else if (players.length === 4) {
+          void tryStartQuickMatch();
         }
-      });
+      }
     };
     const channel = client
       .channel(`quick-match-lobby:${quickMatchLobbyId}`)
@@ -935,29 +910,25 @@ function PlayGameStarter({
       )
       .on(
         "postgres_changes",
-        { event: "INSERT", schema: "public", table: "lobby_players", filter: `lobby_id=eq.${quickMatchLobbyId}` },
+        { event: "*", schema: "public", table: "lobby_players", filter: `lobby_id=eq.${quickMatchLobbyId}` },
         refreshLobbySnapshot,
       )
       .on(
         "postgres_changes",
-        { event: "INSERT", schema: "public", table: "quick_match_queue", filter: `lobby_id=eq.${quickMatchLobbyId}` },
+        { event: "*", schema: "public", table: "quick_match_queue", filter: `lobby_id=eq.${quickMatchLobbyId}` },
         refreshLobbySnapshot,
       )
       .on(
         "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "quick_match_queue", filter: `lobby_id=eq.${quickMatchLobbyId}` },
+        { event: "UPDATE", schema: "public", table: "profiles" },
         refreshLobbySnapshot,
       )
-      .on(
-        "postgres_changes",
-        { event: "DELETE", schema: "public", table: "quick_match_queue" },
-        ({ old: row }) => {
-          if (row["lobby_id"] === quickMatchLobbyId) refreshLobbySnapshot();
-        },
-      )
-      .subscribe((status) => {
-        if (status !== "SUBSCRIBED") return;
-        refreshLobbySnapshot();
+      .subscribe((status, error) => {
+        if (status === "SUBSCRIBED") {
+          refreshLobbySnapshot();
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn("Quick-match Realtime connection failed:", error?.message ?? status);
+        }
       });
     quickMatchLobbyChannelRef.current = channel;
     return () => {
@@ -970,88 +941,33 @@ function PlayGameStarter({
   }, [quickMatchWaiting, quickMatchLobbyId, applyQuickMatchRoster, launchQuickMatchIfEligible, tryStartQuickMatch]);
 
   useEffect(() => {
-    const client = supabase;
-    if (!quickMatchWaiting || !client || !quickMatchLobbyId || !user?.id) return;
-    let active = true;
-    let tracked = false;
-    const channel = client.channel(`quick-match-presence:${quickMatchLobbyId}`, {
-      config: { presence: { key: user.id } },
-    });
-    channel.on("presence", { event: "sync" }, () => {
-      if (!active || !tracked) return;
-      const players = Object.values(channel.presenceState())
-        .flatMap((entries) => entries as Array<{ player?: LobbyPlayer }>)
-        .map((entry) => entry.player)
-        .filter((player): player is LobbyPlayer => Boolean(
-          player?.id && !departedQuickMatchPlayersRef.current.has(player.id),
-        ));
-      const uniquePlayers = [...new Map(players.map((player) => [player.id, player])).values()];
-      const knownPlayers = new Map(quickMatchPlayersRef.current.map((player) => [player.id, player]));
-      uniquePlayers.forEach((player) => knownPlayers.set(player.id, player));
-      applyQuickMatchRoster([...knownPlayers.values()]);
-    });
-    channel.subscribe((status) => {
-      if (status !== "SUBSCRIBED" || !active) return;
-      const player = quickMatchPlayersRef.current.find((item) => item.id === user.id);
-      if (!player) return;
-      void channel.track({ player }).then(() => {
-        tracked = true;
-        const players = Object.values(channel.presenceState())
-          .flatMap((entries) => entries as Array<{ player?: LobbyPlayer }>)
-          .map((entry) => entry.player)
-          .filter((entry): entry is LobbyPlayer => Boolean(
-            entry?.id && !departedQuickMatchPlayersRef.current.has(entry.id),
-          ));
-        const uniquePlayers = [...new Map(players.map((entry) => [entry.id, entry])).values()];
-        const knownPlayers = new Map(quickMatchPlayersRef.current.map((entry) => [entry.id, entry]));
-        uniquePlayers.forEach((entry) => knownPlayers.set(entry.id, entry));
-        applyQuickMatchRoster([...knownPlayers.values()]);
-      });
-    });
-    quickMatchPresenceChannelRef.current = channel;
-    return () => {
-      active = false;
-      if (quickMatchPresenceChannelRef.current === channel) {
-        quickMatchPresenceChannelRef.current = null;
-        void client.removeChannel(channel);
-      }
-    };
-  }, [quickMatchWaiting, quickMatchLobbyId, applyQuickMatchRoster, user?.id]);
-
-  useEffect(() => {
     if (!quickMatchWaiting || !quickMatchLobbyCreatedAt) return;
     const syncCountdown = () => {
+      const activePlayerCount = quickMatchPlayers.filter((player) => player.connected === true).length;
+      if (activePlayerCount < 2) {
+        quickMatchCountdownRef.current = QUICK_MATCH_COUNTDOWN_SECONDS;
+        setQuickMatchCountdown(QUICK_MATCH_COUNTDOWN_SECONDS);
+        return;
+      }
       const createdAtMs = new Date(quickMatchLobbyCreatedAt).getTime();
       if (!Number.isFinite(createdAtMs)) return;
       const remainingSeconds = Math.max(
         0,
         QUICK_MATCH_COUNTDOWN_SECONDS - Math.floor((Date.now() - createdAtMs) / 1000),
       );
-      quickMatchCountdownRef.current = remainingSeconds;
       setQuickMatchCountdown(remainingSeconds);
       if (remainingSeconds === 0 && quickMatchLobbyId) {
-        const activePlayers = quickMatchPlayersRef.current.filter(
-          (player) => !departedQuickMatchPlayersRef.current.has(player.id),
-        );
-        if (activePlayers.length < 2) {
-          const resetAt = new Date().toISOString();
-          quickMatchCountdownRef.current = QUICK_MATCH_COUNTDOWN_SECONDS;
-          setQuickMatchCountdown(QUICK_MATCH_COUNTDOWN_SECONDS);
-          setQuickMatchLobbyCreatedAt(resetAt);
-        }
         void tryStartQuickMatch();
       }
     };
     syncCountdown();
     const timer = window.setInterval(syncCountdown, 1000);
     return () => window.clearInterval(timer);
-  }, [quickMatchWaiting, quickMatchLobbyCreatedAt, quickMatchLobbyId, tryStartQuickMatch]);
+  }, [quickMatchWaiting, quickMatchLobbyCreatedAt, quickMatchLobbyId, quickMatchPlayers, tryStartQuickMatch]);
 
   const cancelQuickMatch = async () => {
     quickMatchCancelRequested.current = true;
     const lobbyId = quickMatchLobbyId;
-    const presenceChannel = quickMatchPresenceChannelRef.current;
-    if (presenceChannel) void presenceChannel.untrack();
     clearQuickMatchLocalState();
     removeQuickMatchChannels();
     await leaveQuickMatchRpc(lobbyId);
@@ -1092,24 +1008,8 @@ function PlayGameStarter({
     window.dispatchEvent(new Event("show-gold-counter"));
   };
 
-  const finishLobby = async () => {
-    if (typeof window !== "undefined") localStorage.removeItem("active_quick_match_lobby");
-    if (supabase && lobbySession && user?.id) {
-      if (lobbySession.isHost) {
-        await supabase.from("game_lobbies").update({ status: "finished" }).eq("id", lobbySession.id).eq("host_id", user.id);
-      } else {
-        await supabase.from("lobby_players").delete().eq("lobby_id", lobbySession.id).eq("user_id", user.id);
-      }
-      await leaveQuickMatchRpc(lobbySession.id);
-    }
-    clearLobbyState();
-    setPlaying(false);
-    window.dispatchEvent(new Event("show-gold-counter"));
-  };
-
   const handleRemoteLobbyDisband = useCallback(() => {
     clearLobbyState();
-    setPlaying(false);
     window.dispatchEvent(new Event("show-gold-counter"));
     toast.message("ژوورەکە لەلایەن خاوەن ژوورەوە تێکدرا.", { duration: 2800 });
   }, []);
@@ -1175,37 +1075,37 @@ function PlayGameStarter({
           alt="Snakes and Ladders"
           className="w-[80%] max-w-[310px] h-auto object-contain mt-4 mb-1 drop-shadow-2xl pointer-events-none"
         />
-        <div className="my-3 grid w-full max-w-[360px] grid-cols-4 items-center gap-3 mx-auto z-10">
+        <div className="my-3 grid w-full max-w-[420px] grid-cols-4 items-center gap-3 mx-auto z-10">
           {/* Board */}
           <button
             onClick={onOpenBoard}
             className="flex aspect-square w-full min-w-0 items-center justify-center overflow-hidden border-0 bg-transparent p-0 outline-none focus:outline-none cursor-pointer"
           >
-            <img src="/baso1.png" alt="تەختە" className="size-[88%] object-contain block select-none drop-shadow-md transition-transform active:scale-95" />
+            <img src="/baso1.png" alt="تەختە" className="block size-[92%] object-contain p-1 select-none drop-shadow-md transition-transform active:scale-95" />
           </button>
           {/* Sticker */}
           <button
             onClick={onOpenSticker}
             className="flex aspect-square w-full min-w-0 items-center justify-center overflow-hidden border-0 bg-transparent p-0 outline-none focus:outline-none cursor-pointer"
           >
-            <img src="/baso2.png" alt="ستیکەر" className="size-[88%] object-contain block select-none drop-shadow-md transition-transform active:scale-95" />
+            <img src="/baso2.png" alt="ستیکەر" className="block size-[92%] object-contain p-1 select-none drop-shadow-md transition-transform active:scale-95" />
           </button>
           {/* Sound */}
           <button
             onClick={onOpenSound}
             className="flex aspect-square w-full min-w-0 items-center justify-center overflow-hidden border-0 bg-transparent p-0 outline-none focus:outline-none cursor-pointer"
           >
-            <img src="/baso3.png" alt="ساوند" className="size-[88%] object-contain block select-none drop-shadow-md transition-transform active:scale-95" />
+            <img src="/baso3.png" alt="ساوند" className="block size-[92%] object-contain p-1 select-none drop-shadow-md transition-transform active:scale-95" />
           </button>
           {/* Coins */}
           <button
             onClick={onOpenToken}
             className="flex aspect-square w-full min-w-0 items-center justify-center overflow-hidden border-0 bg-transparent p-0 outline-none focus:outline-none cursor-pointer"
           >
-            <img src="/baso4.png" alt="پووڵ" className="size-[88%] object-contain block select-none drop-shadow-md transition-transform active:scale-95" />
+            <img src="/baso4.png" alt="پووڵ" className="block size-[92%] object-contain p-1 select-none drop-shadow-md transition-transform active:scale-95" />
           </button>
         </div>
-        <div className="flex flex-col items-center gap-3 w-full mt-2">
+        <div className="-mt-3 flex w-full -translate-y-2 flex-col items-center gap-3">
           <button
             type="button"
             onClick={() => void joinQuickMatch()}
@@ -1237,18 +1137,26 @@ function PlayGameStarter({
       </div>
 
       {quickMatchWaiting && typeof document !== "undefined" && createPortal((
-        <div className="fixed inset-0 z-[9999] flex min-h-dvh flex-col overflow-y-auto bg-black/90 text-white backdrop-blur-md">
-          <div className="pointer-events-none absolute inset-0 opacity-35" style={{ background: "radial-gradient(ellipse at 50% 0%, rgba(217,164,65,.24), transparent 48%), radial-gradient(ellipse at 10% 90%, rgba(16,185,129,.18), transparent 42%)" }} />
+        <div
+          className="fixed inset-0 z-[9999] isolate flex min-h-dvh flex-col overflow-y-auto bg-[#07130f] text-white"
+          style={{
+            backgroundImage: "url('/play_bg.png')",
+            backgroundSize: "cover",
+            backgroundPosition: "center",
+          }}
+        >
+          <div className="pointer-events-none absolute inset-0 z-0 bg-black/35 backdrop-blur-[1px]" />
+          <div className="pointer-events-none absolute inset-0 z-[1] opacity-35" style={{ background: "radial-gradient(ellipse at 50% 0%, rgba(217,164,65,.24), transparent 48%), radial-gradient(ellipse at 10% 90%, rgba(16,185,129,.18), transparent 42%)" }} />
           <button
             type="button"
             onClick={() => void cancelQuickMatch()}
             aria-label="Cancel matchmaking"
             title="Cancel matchmaking"
-            className="absolute right-4 top-[max(1rem,env(safe-area-inset-top))] z-10 grid size-11 place-items-center rounded-full border border-red-300/35 bg-red-500/15 text-red-100 transition hover:bg-red-500/30 active:scale-95"
+            className="absolute right-4 top-[max(1rem,env(safe-area-inset-top))] z-20 grid size-11 place-items-center rounded-full border border-red-300/35 bg-red-500/15 text-red-100 transition hover:bg-red-500/30 active:scale-95"
           >
             <X className="size-5" />
           </button>
-          <main className="relative mx-auto flex min-h-dvh w-full max-w-4xl flex-1 flex-col items-center px-5 pb-8 pt-[max(2rem,env(safe-area-inset-top))]">
+          <main className="relative z-10 mx-auto flex min-h-dvh w-full max-w-4xl flex-1 flex-col items-center px-5 pb-8 pt-[max(2rem,env(safe-area-inset-top))]">
             <header className="mt-4 text-center">
               <p className="text-xs font-bold uppercase text-amber-200/65">Quick Match</p>
               <h1 className="mt-2 text-2xl font-extrabold sm:text-3xl">دۆزینەوەی یاریزان</h1>
@@ -1280,14 +1188,7 @@ function PlayGameStarter({
             <section className="mt-8 w-full" aria-label="Quick match player slots">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 sm:gap-4">
                 {Array.from({ length: 4 }, (_, slotIndex) => {
-                  const localPlayer = quickMatchPlayers.find((player) => player.id === user?.id) ?? {
-                    id: user?.id ?? "me",
-                    name: user?.name ?? "من",
-                    avatar: user?.avatar ?? "",
-                    ...(selectedToken?.image_url ? { token_url: selectedToken.image_url } : {}),
-                  };
-                  const opponents = quickMatchPlayers.filter((player) => player.id !== user?.id);
-                  const player = slotIndex === 0 ? localPlayer : opponents[slotIndex - 1];
+                  const player = quickMatchPlayers[slotIndex];
                   return (
                     <div
                       key={player?.id ?? `waiting-slot-${slotIndex}`}
@@ -1300,10 +1201,12 @@ function PlayGameStarter({
                             {player.token_url && (
                               <img src={avatarImageSource(player.token_url)} alt="Pawn" className="absolute -bottom-1 -right-2 size-7 rounded-full border border-amber-200/70 bg-emerald-950 object-cover" />
                             )}
+                            <span className={`absolute bottom-0 left-0 size-3 rounded-full border-2 border-emerald-950 ${player.connected ? "bg-emerald-400" : "bg-red-400"}`} />
                           </div>
                           <div className="min-w-0">
                             <p className="truncate text-sm font-extrabold">{player.name}</p>
-                            <p className="mt-1 text-[10px] font-bold text-emerald-200/60">{slotIndex === 0 ? "تۆ" : "یاریزانی ئۆنلاین"}</p>
+                            <p className="mt-1 truncate text-[10px] font-bold text-emerald-200/60">{player.id}</p>
+                            <p className="mt-1 text-[10px] font-bold text-emerald-200/60">{player.connected ? "Online" : "Disconnected"}</p>
                           </div>
                         </>
                       ) : (
@@ -1341,24 +1244,6 @@ function PlayGameStarter({
         </div>
       ), document.body)}
 
-      {playing && (
-        <SnakesGame
-          board={lobbyMatch?.board ?? selectedBoard}
-          me={{
-            name: user?.name ?? "من",
-            avatar: user?.avatar ?? "",
-            token_url: selectedToken?.image_url ?? (user as any)?.token_url,
-          }}
-          stickers={stickers}
-          {...(lobbyMatch ? { initialPlayers: lobbyMatch.players, matchId: lobbyMatch.gameId } : {})}
-          onClose={() => {
-            setPlaying(false);
-            if (lobbySession) void finishLobby();
-            else setLobbyMatch(null);
-            window.dispatchEvent(new Event("show-gold-counter"));
-          }}
-        />
-      )}
       {friendsLobbyOpen && (
         <FriendsPlayOverlay
           friends={visibleFriends}

@@ -150,6 +150,12 @@ function PlayerAvatar({ player, pro = false }: { player: GamePlayer; pro?: boole
           </span>
         </>
       )}
+      {typeof player.connected === "boolean" && (
+        <span
+          className={`absolute -bottom-1 -left-1 size-2.5 rounded-full border border-white ${player.connected ? "bg-emerald-500" : "bg-red-500"}`}
+          aria-label={player.connected ? "Online" : "Offline"}
+        />
+      )}
     </div>
   );
 }
@@ -211,13 +217,27 @@ export function SnakesGame({
   me,
   stickers = [],
   initialPlayers,
+  initialTurn = 0,
+  initialTurnNumber = 0,
+  initialTurnStartedAt,
   matchId = DEFAULT_MATCH_ID,
   onClose,
 }: {
   board: BoardSkin & { image_url?: string };
   me: { name: string; avatar: string; token_url?: string };
   stickers?: any[];
-  initialPlayers?: Array<{ id: string; name: string; avatar: string; token_url?: string }>;
+  initialPlayers?: Array<{
+    id: string;
+    name: string;
+    avatar: string;
+    token_url?: string;
+    score?: number;
+    position?: number;
+    connected?: boolean;
+  }>;
+  initialTurn?: number;
+  initialTurnNumber?: number;
+  initialTurnStartedAt?: string;
   matchId?: string;
   onClose: () => void;
 }) {
@@ -234,7 +254,9 @@ export function SnakesGame({
         avatar: player.avatar,
         color: PLAYER_COLORS[index]!,
       isHuman: player.id === (user?.id ?? "me"),
-        position: 0,
+        position: player.position ?? 0,
+      ...(typeof player.score === "number" ? { score: player.score } : {}),
+      ...(typeof player.connected === "boolean" ? { connected: player.connected } : {}),
         ...(player.token_url ? { token_url: player.token_url } : {}),
       }))
     : [
@@ -256,7 +278,9 @@ export function SnakesGame({
           position: 0,
         })),
       ]);
-  const [turn, setTurn] = useState(0);
+  const [turn, setTurn] = useState(() => Math.max(0, Math.min(initialTurn, (initialPlayers?.length ?? 1) - 1)));
+  const [turnNumber, setTurnNumber] = useState(initialTurnNumber);
+  const [turnStartedAt, setTurnStartedAt] = useState(initialTurnStartedAt ?? new Date().toISOString());
   const [dice, setDice] = useState(1);
   const [rolling, setRolling] = useState(false);
   const [status, setStatus] = useState("");
@@ -281,10 +305,70 @@ export function SnakesGame({
     null,
   );
   const gameStatusUpdate = useRef(Promise.resolve());
-  const turnHandlerRef = useRef<(payload: { playerId?: string; turnIndex?: number; roll?: number; turnId?: string }) => void>(() => {});
-  const processedTurnIds = useRef(new Set<string>());
+  const turnNumberRef = useRef(turnNumber);
   playersRef.current = players;
   turnRef.current = turn;
+  turnNumberRef.current = turnNumber;
+
+  const applySessionSnapshot = useCallback((row: {
+    game_id?: string;
+    players?: unknown;
+    turn_index?: number;
+    turn_number?: number;
+    turn_started_at?: string;
+    last_roll?: number | null;
+    status?: string;
+  }) => {
+    if (
+      row.game_id !== matchId
+      || !Array.isArray(row.players)
+      || typeof row.turn_index !== "number"
+      || typeof row.turn_number !== "number"
+      || row.turn_number <= turnNumberRef.current
+    ) return;
+    const sessionPlayers = row.players as Array<{
+      id: string;
+      position?: number;
+      score?: number;
+      connected?: boolean;
+      name?: string;
+      avatar?: string;
+      token_url?: string | null;
+    }>;
+    setPlayers((current) => sessionPlayers.flatMap((sessionPlayer, index) => {
+      const previous = current.find((player) => player.id === sessionPlayer.id);
+      if (!previous) return [];
+      return [{
+        ...previous,
+        ...(sessionPlayer.name ? { name: sessionPlayer.name } : {}),
+        ...(sessionPlayer.avatar ? { avatar: sessionPlayer.avatar } : {}),
+        position: sessionPlayer.position ?? previous.position,
+        ...(sessionPlayer.score !== undefined || previous.score !== undefined
+          ? { score: sessionPlayer.score ?? previous.score! }
+          : {}),
+        ...(sessionPlayer.connected !== undefined || previous.connected !== undefined
+          ? { connected: sessionPlayer.connected ?? previous.connected! }
+          : {}),
+        ...(sessionPlayer.token_url ? { token_url: sessionPlayer.token_url } : {}),
+        color: PLAYER_COLORS[index] ?? previous.color,
+      }];
+    }));
+    const nextTurn = Math.max(0, Math.min(row.turn_index, sessionPlayers.length - 1));
+    setTurn(nextTurn);
+    turnRef.current = nextTurn;
+    setTurnNumber(row.turn_number);
+    turnNumberRef.current = row.turn_number;
+    if (row.turn_started_at) setTurnStartedAt(row.turn_started_at);
+    if (typeof row.last_roll === "number") setDice(row.last_roll);
+    setRolling(false);
+    busy.current = false;
+    setTimerRound((round) => round + 1);
+    if (row.status === "finished") {
+      const winnerPlayer = sessionPlayers.find((player) => player.position === LAST_SQUARE);
+      const winnerState = winnerPlayer && playersRef.current.find((player) => player.id === winnerPlayer.id);
+      if (winnerState) setWinner({ ...winnerState, position: LAST_SQUARE });
+    }
+  }, [matchId]);
 
   useEffect(() => {
     alive.current = true;
@@ -375,18 +459,26 @@ export function SnakesGame({
     channel.on("broadcast", { event: "PIECE_CAPTURED" }, ({ payload }) => {
       playCaptureSound(payload?.soundUrl);
     });
-    channel.on("broadcast", { event: "TURN_ROLLED" }, ({ payload }) => {
-      turnHandlerRef.current(payload);
-    });
+    channel.on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "game_sessions", filter: `game_id=eq.${matchId}` },
+      ({ new: row }) => applySessionSnapshot(row as Parameters<typeof applySessionSnapshot>[0]),
+    );
     reactionChannelRef.current = channel;
-    void channel.subscribe((status) => setMatchChannelReady(status === "SUBSCRIBED"));
+    void channel.subscribe((status, error) => {
+      setMatchChannelReady(status === "SUBSCRIBED");
+      if (status === "SUBSCRIBED") handledTimeout.current = null;
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        console.warn("Game Realtime connection failed:", error?.message ?? status);
+      }
+    });
 
     return () => {
       reactionChannelRef.current = null;
       setMatchChannelReady(false);
       void supabase.removeChannel(channel);
     };
-  }, [matchId, playCaptureSound]);
+  }, [applySessionSnapshot, matchId, playCaptureSound]);
 
   useEffect(() => {
     if (phase !== "matchmaking") return;
@@ -421,13 +513,20 @@ export function SnakesGame({
   useEffect(() => {
     if (phase !== "playing" || winner || !currentPlayer || currentPlayer.kicked) return;
 
-    setTimeLeft(TURN_SECONDS);
+    if (synchronizedMatch) {
+      const startedAt = new Date(turnStartedAt).getTime();
+      setTimeLeft(Number.isFinite(startedAt)
+        ? Math.max(0, TURN_SECONDS - Math.floor((Date.now() - startedAt) / 1000))
+        : TURN_SECONDS);
+    } else {
+      setTimeLeft(TURN_SECONDS);
+    }
     const interval = window.setInterval(() => {
       setTimeLeft((seconds) => Math.max(0, seconds - 1));
     }, 1000);
 
     return () => window.clearInterval(interval);
-  }, [currentPlayer?.id, currentPlayer?.kicked, phase, timerRound, turn, winner]);
+  }, [currentPlayer?.id, currentPlayer?.kicked, phase, synchronizedMatch, timerRound, turn, turnStartedAt, winner]);
 
   const takeTurn = useCallback(
     async (playerIndex: number, automatic = false, synchronizedRoll?: number) => {
@@ -545,46 +644,55 @@ export function SnakesGame({
     [localPlayerId, nextTurnIndex, playCaptureSound, players, setPos, user?.id, winner],
   );
 
-  turnHandlerRef.current = ({ playerId, turnIndex, roll, turnId }) => {
-    if (
-      !synchronizedMatch ||
-      typeof playerId !== "string" ||
-      typeof turnIndex !== "number" ||
-      typeof roll !== "number" ||
-      !Number.isInteger(roll) ||
-      roll < 1 ||
-      roll > 6 ||
-      (turnId && processedTurnIds.current.has(turnId)) ||
-      turnRef.current !== turnIndex ||
-      playersRef.current[turnIndex]?.id !== playerId ||
-      playerId === localPlayerId
-    ) return;
-    if (turnId) processedTurnIds.current.add(turnId);
-    void takeTurn(turnIndex, false, roll);
-  };
-
   const requestTurn = useCallback(async (playerIndex: number, automatic = false) => {
     const current = playersRef.current[playerIndex];
-    if (!current || current.id !== localPlayerId) return;
+    if (!current || (!automatic && current.id !== localPlayerId)) return;
     if (!synchronizedMatch) {
+      if (current.id !== localPlayerId) return;
       void takeTurn(playerIndex, automatic);
       return;
     }
-    if (!matchChannelReady || !reactionChannelRef.current) return;
-    const roll = 1 + Math.floor(Math.random() * 6);
-    const turnId = crypto.randomUUID();
-    const result = await reactionChannelRef.current.send({
-      type: "broadcast",
-      event: "TURN_ROLLED",
-      payload: { playerId: current.id, turnIndex: playerIndex, roll, turnId },
+    if (!supabase || !matchChannelReady || !reactionChannelRef.current) return;
+    const positionsBeforeRoll = new Map(playersRef.current.map((player) => [player.id, player.position]));
+    setRolling(true);
+    const { data, error } = await supabase.rpc("roll_game_turn", {
+      p_game_id: matchId,
+      p_expected_turn_number: turnNumberRef.current,
     });
-    if (result !== "ok") {
-      setStatus("پەیوەندی یاری لەدەست چوو، دووبارە هەوڵ بدەرەوە");
+    if (error) {
+      setRolling(false);
+      if (automatic) {
+        handledTimeout.current = null;
+        setTimeLeft(1);
+      } else {
+        setStatus(error.message.includes("stale") ? "نۆرەکە گۆڕاوە، چاوەڕێی یاریزانی داهاتوو بە" : "پەیوەندی یاری لەدەست چوو، دووبارە هەوڵ بدەرەوە");
+      }
       return;
     }
-    processedTurnIds.current.add(turnId);
-    void takeTurn(playerIndex, automatic, roll);
-  }, [localPlayerId, matchChannelReady, synchronizedMatch, takeTurn]);
+    const committedSession = data as Parameters<typeof applySessionSnapshot>[0];
+    const committedPlayers = Array.isArray(committedSession.players)
+      ? committedSession.players as Array<{ id: string; position?: number; name?: string }>
+      : [];
+    const capturedPlayers = committedPlayers.filter((player) =>
+      (positionsBeforeRoll.get(player.id) ?? 0) > 0 && player.position === 0,
+    );
+    if (capturedPlayers.length) {
+      const soundUrl = user?.id ? localStorage.getItem(userStorageKey(user.id, "active_sound")) : null;
+      playCaptureSound(soundUrl);
+      void reactionChannelRef.current?.send({
+        type: "broadcast",
+        event: "PIECE_CAPTURED",
+        payload: {
+          attackerId: current.id,
+          targetId: capturedPlayers[0]?.id,
+          capturedPlayerIds: capturedPlayers.map((player) => player.id),
+          soundUrl,
+        },
+      });
+    }
+    applySessionSnapshot(committedSession);
+    setStatus("");
+  }, [applySessionSnapshot, localPlayerId, matchChannelReady, matchId, playCaptureSound, synchronizedMatch, takeTurn, user?.id]);
 
   useEffect(() => {
     if (timeLeft !== 0 || !currentPlayer || winner || busy.current) return;
@@ -594,6 +702,10 @@ export function SnakesGame({
 
     const misses = (missedTurns.current[currentPlayer.id] ?? 0) + 1;
     missedTurns.current[currentPlayer.id] = misses;
+    if (synchronizedMatch) {
+      void requestTurn(turn, true);
+      return;
+    }
     if (misses >= 3) {
       const playerId = currentPlayer.id;
       const playerName = currentPlayer.name;
@@ -610,7 +722,7 @@ export function SnakesGame({
 
     if (currentPlayer.id === localPlayerId) {
       void requestTurn(turn, true);
-    } else if (!synchronizedMatch) {
+    } else {
       void takeTurn(turn, true);
     }
   }, [currentPlayer, localPlayerId, nextTurnIndex, requestTurn, synchronizedMatch, takeTurn, timeLeft, timerRound, turn, winner]);
@@ -646,7 +758,7 @@ export function SnakesGame({
     !rolling &&
     !busy.current;
   const meP = players.find((player) => player.id === localPlayerId) ?? players[0]!;
-  const opponents = players.slice(1);
+  const opponents = players.filter((player) => player.id !== localPlayerId);
   const myTurnActive = players[turn]?.id === meP.id;
   const boardImageUrl = board?.image_url || "";
 
@@ -762,9 +874,12 @@ export function SnakesGame({
                     </button>
                     <div className="min-w-0 flex-1 flex flex-col justify-center">
                       <p className="truncate text-[10px] font-bold text-[#2c2c2c]">{p.name}</p>
-                      <span className="mt-0.5 inline-block w-max rounded bg-[#f4f1e6] px-1 py-0.5 text-[9px] font-bold text-[#8a6d1f]">
-                        {p.position}/100
-                      </span>
+                      <div className="mt-0.5 flex items-center gap-1">
+                        <span className="inline-block w-max rounded bg-[#f4f1e6] px-1 py-0.5 text-[9px] font-bold text-[#8a6d1f]">
+                          {p.position}/100
+                        </span>
+                        <span className="text-[9px] font-bold text-[#6b5a3e]">{p.score ?? 0} pts</span>
+                      </div>
                     </div>
                     {timerVisible && players[turn]?.id === p.id && (
                       <div className="absolute left-2 top-1/2 -translate-y-1/2">
@@ -860,6 +975,7 @@ export function SnakesGame({
               </div>
               <div className="min-w-0 flex-1">
                 <p className="truncate text-xs font-bold text-[#2c2c2c]">{meP.name}</p>
+                <p className="text-[9px] font-bold text-[#6b5a3e]">{meP.score ?? 0} pts</p>
                 <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-[#eee8dc]">
                   <div
                     className="h-full rounded-full transition-all duration-300"
